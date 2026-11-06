@@ -1,0 +1,37 @@
+# ── EMA20 拐头反转 · 量化实盘交易配置 ──
+
+# ============ 账户与网络 ============
+proxy: "http://127.0.0.1:10808"       # 本地代理（币安访问必需）
+testnet: false                         # false = 真实合约，true = 测试网
+
+# ============ 选币池 ============
+min_volume_usdt: 18000000              # 24h 成交额下限（USDT）
+max_price_usdt: 1.0                    # 价格上限（USDT），只保留 <= 该值的币
+
+# ============ 信号参数 ============
+ema_period: 20                         # EMA 周期
+min_down_bars: 8                       # 向上拐头前需连续不涨最少根数
+min_up_bars: 8                         # 向下拐头前需连续不跌最少根数
+min_body_pct: 1.0                      # 拐头 K 线实体涨/跌幅下限（%）
+max_body_pct: 6.5                     # 拐头 K 线实体涨/跌幅上限（%），超过则不交易（止损幅度过大）
+
+# ============ 数据/计算 ============
+window_size: 300                       # 滑动窗口长度（根）
+warmup_limit: 500                      # 预热拉取历史 K 线数
+max_workers: 20                        # 并发线程数
+batch_size: 25                         # 每批拉取币数
+batch_interval: 1.5                    # 批间间隔（秒）
+rescan_interval: 14400                 # 候选池刷新间隔（秒）
+lead_seconds: 15                       # 15m K 线收盘前提前触发秒数
+
+# ============ 交易规则 ============
+order_notional_usdt: 108.0             # 每笔名义仓位（USDT）
+risk_reward_ratio: 2.0                 # 盈亏比（止损:止盈 = 2:1，即亏2赚1）
+max_positions: 15                      # 最大同时持仓数
+max_long_signals_per_bar: 6            # 同一根K线同时触发做多信号 >= 该值时，本轮所有做多信号都不做（防诱多团灭）
+cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（秒）= 15 分钟
+leverage: 10                           # 杠杆倍数（10x）
+cool_after_stops: 3                    # 连续 N 笔止损后进入冷静期
+cool_seconds: 9000                     # 冷静期时长（秒）= 2.5 小时
+enable_reverse: true                   # 反手开关：信号K之后第1根EMA不顺时平仓反手
+reverse_check_min_hold: 900            # 反手前原单需持仓>=该秒数（默认15分钟，避免误伤快速止盈单）

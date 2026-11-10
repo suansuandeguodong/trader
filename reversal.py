@@ -81,20 +81,6 @@ class EMA20Reversal:
         st = self._state.get(symbol)
         return list(st["ema_history"]) if st else []
 
-    def slope_ok(self, symbol: str) -> bool:
-        """
-        斜率过滤（理解 A）：
-        向上拐头时，拐头上涨斜率 (E0 - E1) 要大于前一下跌斜率 (E2 - E1)，
-        即 E0 > E2。这里 E0=当前EMA, E1=前一根EMA, E2=前二根EMA。
-        需要至少 3 个 EMA 值，少于 3 个时视为不满足。
-        """
-        h = self.get_ema_history(symbol)
-        if len(h) < 3:
-            return False
-        e2, e1, e0 = h[-3], h[-2], h[-1]
-        # 向上拐头：E0 > E1 且 拐头斜率 > 前一下跌斜率
-        # 即 (E0 - E1) > (E2 - E1) 等价于 E0 > E2
-        return e0 > e1 and (e0 - e1) > (e2 - e1)
 
     # ── 核心判定 ──
 

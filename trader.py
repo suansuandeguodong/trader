@@ -51,7 +51,7 @@ EMA_PERIOD = CFG.get("ema_period", 20)
 MIN_DOWN_BARS = CFG.get("min_down_bars", 8)
 MIN_UP_BARS = CFG.get("min_up_bars", 8)
 MIN_BODY_PCT = CFG.get("min_body_pct", 1.0)
-MAX_BODY_PCT = CFG.get("max_body_pct", 11.0)
+MAX_BODY_PCT = CFG.get("max_body_pct", 3.5)
 WINDOW_SIZE = CFG.get("window_size", 300)
 WARMUP_LIMIT = CFG.get("warmup_limit", 500)
 MAX_WORKERS = CFG.get("max_workers", 20)
@@ -671,7 +671,7 @@ def main():
                     if body_pct > MAX_BODY_PCT:
                         # 实体涨幅过大，止损幅度毁灭，过滤
                         print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% > {MAX_BODY_PCT}%（实体过大）")
-                    elif body_pct >= MIN_BODY_PCT and rev_up.slope_ok(sym):
+                    elif body_pct >= MIN_BODY_PCT:
                         meta = {
                             "bar_time": b["t"],
                             "open": o, "high": b["h"], "low": b["l"],
@@ -684,11 +684,9 @@ def main():
                         signals.append((sym, "LONG", o, c, meta))
                         tlog.log_signal(sym, "LONG", meta)
                         print(f"\n  >>> [信号·做多] {sym} 拐头向上 "
-                              f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%, 斜率达标) <<<\n")
+                              f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%) <<<\n")
                     elif body_pct < MIN_BODY_PCT:
                         print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% < {MIN_BODY_PCT}%")
-                    elif not rev_up.slope_ok(sym):
-                        print(f"  [过滤] {sym} 拐头但斜率不足")
 
                 # 向下拐头（做空）
                 down_before = rev_down.get_up_count(sym)
@@ -698,7 +696,7 @@ def main():
                     if body_pct < -MAX_BODY_PCT:
                         # 实体跌幅过大，过滤
                         print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% < -{MAX_BODY_PCT}%（实体过大）")
-                    elif body_pct <= -MIN_BODY_PCT and rev_down.slope_ok(sym):
+                    elif body_pct <= -MIN_BODY_PCT:
                         meta = {
                             "bar_time": b["t"],
                             "open": o, "high": b["h"], "low": b["l"],
@@ -711,11 +709,9 @@ def main():
                         signals.append((sym, "SHORT", o, c, meta))
                         tlog.log_signal(sym, "SHORT", meta)
                         print(f"\n  >>> [信号·做空] {sym} 拐头向下 "
-                              f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%, 斜率达标) <<<\n")
+                              f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%) <<<\n")
                     elif body_pct > -MIN_BODY_PCT:
                         print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% > {-MIN_BODY_PCT}%")
-                    elif not rev_down.slope_ok(sym):
-                        print(f"  [过滤] {sym} 拐头但斜率不足")
 
                 # ── 反手检测：这根K线是某持仓的信号K之后第1根时，判断EMA是否顺着 ──
                 if ENABLE_REVERSE:

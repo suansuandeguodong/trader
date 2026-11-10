@@ -81,17 +81,6 @@ class EMA20ReversalDown:
         st = self._state.get(symbol)
         return list(st["ema_history"]) if st else []
 
-    def slope_ok(self, symbol: str) -> bool:
-        """
-        斜率过滤（理解 A，向下对称）：
-        向下拐头时，拐头下跌斜率 (E1 - E0) 要大于前一上涨斜率 (E1 - E2)，
-        即 E0 < E2。这里 E0=当前EMA, E1=前一根EMA, E2=前二根EMA。
-        """
-        h = self.get_ema_history(symbol)
-        if len(h) < 3:
-            return False
-        e2, e1, e0 = h[-3], h[-2], h[-1]
-        return e0 < e1 and (e1 - e0) > (e1 - e2)
 
     # ── 核心判定 ──
 

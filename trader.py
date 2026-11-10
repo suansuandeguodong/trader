@@ -36,6 +36,7 @@ from reversal import EMA20Reversal
 from reversal_down import EMA20ReversalDown
 from broker import BinanceFutures
 from risk import RiskManager
+from wecom_notifier import WeComNotifier
 import trade_log as tlog
 
 BASE_DIR = Path(__file__).parent
@@ -73,6 +74,7 @@ REVERSE_CHECK_MIN_HOLD = CFG.get("reverse_check_min_hold", 900)
 
 BAR_INTERVAL_MS = 15 * 60 * 1000  # 15m
 _running = True
+_notifier = None  # 企微通知器（main 里初始化，模块级函数复用）
 
 
 # ── 数据拉取 ──
@@ -193,8 +195,27 @@ def sync_positions_from_exchange(rm: RiskManager):
                         if triggered:
                             print(f"  [冷静期] 连续 {rm.cool_after_stops} 笔止损，"
                                   f"进入冷静期 {rm.cool_seconds/3600:.1f} 小时")
+                            _notify(
+                                f"**🛑 连续止损冷静期**\n"
+                                f"\n"
+                                f"连续 <font color=\"warning\">{rm.cool_after_stops}</font> 笔止损，"
+                                f"进入冷静期 {rm.cool_seconds/3600:.1f} 小时，暂停开新仓。"
+                            )
                     else:
                         rm.on_profit()
+
+                # 企微平仓通知（止盈/止损）
+                if realized is not None:
+                    emoji = "❌" if is_stop else "✅"
+                    _notify(
+                        f"**{emoji} {close_reason} · {sym}**\n"
+                        f"\n"
+                        f"方向: {'做多 LONG' if t.direction == 'LONG' else '做空 SHORT'}\n"
+                        f"入场价: {t.entry_price:.6g} USDT\n"
+                        f"已实现盈亏: <font color=\"{'warning' if is_stop else 'info'}\">"
+                        f"{realized:+.4f} USDT</font>"
+                        + (f"\n持仓时长: {hold_sec/60:.1f} 分钟" if hold_sec else "")
+                    )
 
                 # 撤销残留单：
                 #   止损单是 Algo 条件单 -> cancel_algo_order
@@ -385,6 +406,12 @@ def monitor_loop(rm: RiskManager):
             time.sleep(1)
 
 
+def _notify(markdown: str):
+    """统一企微通知出口：notifier 未初始化或未启用时静默跳过。"""
+    if _notifier is not None and _notifier.enabled:
+        _notifier.send_markdown(markdown)
+
+
 def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
                meta: dict = None):
     """按信号开仓。meta 为信号元数据（用于详细落盘）。"""
@@ -465,6 +492,17 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
                   order_id=t.entry_order_id, signal_meta=meta)
     print(f"  [开仓] {sym} {direction} 限价单 qty={qty} @ {entry:.6g} "
           f"(止损@{stop:.6g} 止盈@{tp:.6g})")
+    # 企微开仓通知
+    _notify(
+        f"**📈 开仓信号已下单**\n"
+        f"\n"
+        f"币种: <font color=\"warning\">{sym}</font>\n"
+        f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
+        f"入场价: {entry:.6g} USDT\n"
+        f"止损价: {stop:.6g} USDT\n"
+        f"止盈价: {tp:.6g} USDT\n"
+        f"数量: {qty:.6g}"
+    )
 
 
 def reverse_trade(rm: RiskManager, t, k_open: float, k_close: float):
@@ -557,6 +595,16 @@ def reverse_trade(rm: RiskManager, t, k_open: float, k_close: float):
                   signal_meta={"bar_time": t.signal_bar_time, "reversed_from": orig_dir})
     print(f"  [反手] {sym} 已反向开 {rev_dir} 仓 qty={qty2} @ {entry:.6g} "
           f"(止损@{stop:.6g} 止盈@{tp:.6g})")
+    # 企微反手通知
+    _notify(
+        f"**🔄 反手 · {sym}**\n"
+        f"\n"
+        f"原方向: {'做多 LONG' if orig_dir == 'LONG' else '做空 SHORT'}\n"
+        f"反手为: <font color=\"warning\">{'做多 LONG' if rev_dir == 'LONG' else '做空 SHORT'}</font>\n"
+        f"反手入场: {entry:.6g} USDT\n"
+        f"反手止损: {stop:.6g} USDT\n"
+        f"反手止盈: {tp:.6g} USDT"
+    )
 
 
 # ── 主循环 ──
@@ -585,6 +633,14 @@ def main():
                      cancel_timeout_sec=CANCEL_TIMEOUT_SEC,
                      cool_after_stops=COOL_AFTER_STOPS,
                      cool_seconds=COOL_SECONDS)
+
+    # 企微通知（开仓/平仓/风控）
+    global _notifier
+    _notifier = WeComNotifier(os.getenv("WEBHOOK_URL", ""))
+    if _notifier.enabled:
+        print("企业微信通知已启用")
+    else:
+        print("[提示] WEBHOOK_URL 未配置，跳过企业微信通知")
 
     # 校验账户
     bal = broker.get_balance()
@@ -758,6 +814,12 @@ def main():
             if skip_long:
                 print(f"  [风控] 本轮做多信号 {long_count} 个 >= {MAX_LONG_SIGNALS_PER_BAR}，"
                       f"跳过全部做多信号（疑似诱多）")
+                _notify(
+                    f"**⚠️ 防诱多风控**\n"
+                    f"\n"
+                    f"本轮做多信号 <font color=\"warning\">{long_count}</font> 个 "
+                    f">= {MAX_LONG_SIGNALS_PER_BAR}，跳过全部做多信号（疑似诱多团灭）。"
+                )
             with _rm_lock:
                 for sym, direction, o, c, meta in signals:
                     if direction == "LONG" and skip_long:

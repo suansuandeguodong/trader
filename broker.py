@@ -87,6 +87,11 @@ class BinanceFutures:
                     return {}
                 if resp.status_code == 200:
                     return resp.json()
+                # -2011 Unknown order：订单已不存在（已成交/已撤/已触发），
+                # 属确定性结果，重试无意义，直接返回标记让上层识别，避免空等 5 次。
+                if resp.status_code == 400 and '"code":-2011' in resp.text:
+                    print(f"  [BROKER] {method} {path} 订单已不存在(-2011)，不再重试")
+                    return {"__order_gone__": True}
                 print(f"  [BROKER] {method} {path} HTTP {resp.status_code}: "
                       f"{resp.text[:200]}, retry {attempt+1}/5")
                 # 若仍报时间戳错误，重新校准一次时间

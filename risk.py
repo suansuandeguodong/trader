@@ -34,9 +34,7 @@ class Trade:
     state: str = "PENDING"  # PENDING / FILLED / CANCELLED / CLOSED
     filled_qty: float = 0.0  # 已成交且已挂止损止盈保护的累计数量
     trade_id: Optional[str] = None  # 本地交易标识，用于落盘关联各事件
-    signal_bar_time: Optional[int] = None  # 信号K线 openTime(ms)，用于反手判断「第1根」
-    signal_ema: Optional[float] = None      # 信号K线 EMA 值
-    reverse_done: bool = False              # 是否已反手，防重复
+    signal_bar_time: Optional[int] = None  # 信号K线 openTime(ms)，观察期计时起点
 
 
 class RiskManager:
@@ -97,10 +95,6 @@ class RiskManager:
     def position_side(self, direction: str) -> str:
         """持仓方向标识（双向持仓模式用）：LONG 或 SHORT。"""
         return "LONG" if direction == "LONG" else "SHORT"
-
-    def opposite_direction(self, direction: str) -> str:
-        """反向：LONG->SHORT，SHORT->LONG。"""
-        return "SHORT" if direction == "LONG" else "LONG"
 
     # ── 状态管理 ──
     def _key(self, symbol: str, direction: str) -> tuple:

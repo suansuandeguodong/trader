@@ -69,8 +69,6 @@ CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
 LEVERAGE = CFG.get("leverage", 10)
 COOL_AFTER_STOPS = CFG.get("cool_after_stops", 3)
 COOL_SECONDS = CFG.get("cool_seconds", 9000)
-ENABLE_REVERSE = CFG.get("enable_reverse", False)
-REVERSE_CHECK_MIN_HOLD = CFG.get("reverse_check_min_hold", 900)
 
 BAR_INTERVAL_MS = 15 * 60 * 1000  # 15m
 _running = True
@@ -500,10 +498,9 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
         return
     t.entry_order_id = order.get("orderId")
     t.entry_order_time = time.time()
-    # 记录信号K线信息（用于反手判断）
+    # 记录信号K线时间（观察期计时起点）
     if meta:
         t.signal_bar_time = meta.get("bar_time")
-        t.signal_ema = meta.get("ema")
     # 生成 trade_id 并记录开仓事件
     t.trade_id = tlog.make_trade_id(sym, direction, t.entry_order_time)
     tlog.log_open(sym, direction, t.trade_id, entry, stop, tp, qty,
@@ -520,108 +517,6 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
         f"止损价: {stop:.6g} USDT\n"
         f"止盈价: {tp:.6g} USDT\n"
         f"数量: {qty:.6g}"
-    )
-
-
-def reverse_trade(rm: RiskManager, t, k_open: float, k_close: float):
-    """
-    反手：信号K之后第1根EMA不顺时触发。
-    t         = 原持仓
-    k_open    = 第1根K线开盘价
-    k_close   = 第1根K线收盘价（用作反手入场价）
-    止盈止损规则（复用原信号K线的价格，对调）：
-      - 反手入场价 = 第1根K线收盘价（当前价）
-      - 反手止损价 = 原止盈点（t.take_profit_price）
-      - 反手止盈价 = 原止损点（t.stop_price）
-    即：原做多的止盈点 → 反手做空的止损点，原止损点 → 反手做空的止盈点。
-    """
-    sym = t.symbol
-    orig_dir = t.direction
-    rev_dir = rm.opposite_direction(orig_dir)
-    qty = t.qty if t.qty > 0 else t.filled_qty
-
-    print(f"\n  >>> [反手] {sym} {orig_dir} 第1根EMA不顺，反手 {rev_dir} <<<\n")
-
-    # 1. 撤销原仓的止损/止盈单
-    try:
-        if t.stop_order_id:
-            rm.broker.cancel_algo_order(sym, t.stop_order_id)
-        if t.tp_order_id:
-            rm.broker.cancel_order(sym, t.tp_order_id)
-        rm.broker.cancel_all_open_orders(sym)
-    except Exception as e:
-        print(f"  [反手] {sym} 撤原止损止盈异常: {e}")
-
-    # 2. 市价平掉原仓
-    exit_side = rm.side_for_exit(orig_dir)
-    pos_side = rm.position_side(orig_dir)
-    try:
-        rm.broker.place_market_order(sym, exit_side, qty, position_side=pos_side)
-        print(f"  [反手] {sym} 已市价平掉原 {orig_dir} 仓 qty={qty}")
-    except Exception as e:
-        print(f"  [反手] {sym} 平原仓失败: {e}")
-        return
-
-    # 3. 止盈止损对调：原止盈→新止损，原止损→新止盈；入场用当前价(k_close)
-    entry = k_close
-    stop = t.take_profit_price   # 原止盈点 → 反手止损点
-    tp = t.stop_price            # 原止损点 → 反手止盈点
-
-    # 对齐
-    if rev_dir == "LONG":
-        entry = rm.broker.round_price(sym, entry)
-        stop = rm.broker.round_price(sym, stop, "DOWN")
-        tp = rm.broker.round_price(sym, tp, "UP")
-    else:
-        entry = rm.broker.round_price(sym, entry)
-        stop = rm.broker.round_price(sym, stop, "UP")
-        tp = rm.broker.round_price(sym, tp, "DOWN")
-
-    # 防御：价格不反向（反手止损/止盈应在入场价的两侧）
-    if rev_dir == "LONG" and (tp <= entry or stop >= entry):
-        print(f"  [反手] {sym} 反向仓价格非法（止盈{tp} 止损{stop} 入场{entry}），放弃反手")
-        return
-    if rev_dir == "SHORT" and (tp >= entry or stop <= entry):
-        print(f"  [反手] {sym} 反向仓价格非法（止盈{tp} 止损{stop} 入场{entry}），放弃反手")
-        return
-
-    qty2 = rm.compute_qty(sym, entry)
-    if qty2 <= 0:
-        print(f"  [反手] {sym} 反向仓数量为0，放弃")
-        return
-
-    # 移除原 trade 记录，避免 (sym, pos_side) 冲突
-    rm.remove_trade(sym, orig_dir)
-
-    # 4. 注册并挂反向开仓单
-    t2 = rm.register_trade(sym, rev_dir, entry, stop, tp, qty2)
-    if t2 is None:
-        print(f"  [反手] {sym} 反向仓注册失败（可能已有同向持仓）")
-        return
-    side2 = rm.side_for_entry(rev_dir)
-    pos_side2 = rm.position_side(rev_dir)
-    order = rm.broker.place_limit_order(sym, side2, qty2, entry, position_side=pos_side2)
-    if order is None:
-        rm.remove_trade(sym, rev_dir)
-        print(f"  [反手] {sym} 反向开仓单下单失败")
-        return
-    t2.entry_order_id = order.get("orderId")
-    t2.entry_order_time = time.time()
-    t2.trade_id = tlog.make_trade_id(sym, rev_dir, t2.entry_order_time)
-    tlog.log_open(sym, rev_dir, t2.trade_id, entry, stop, tp, qty2,
-                  order_id=t2.entry_order_id,
-                  signal_meta={"bar_time": t.signal_bar_time, "reversed_from": orig_dir})
-    print(f"  [反手] {sym} 已反向开 {rev_dir} 仓 qty={qty2} @ {entry:.6g} "
-          f"(止损@{stop:.6g} 止盈@{tp:.6g})")
-    # 企微反手通知
-    _notify(
-        f"**🔄 反手 · {sym}**\n"
-        f"\n"
-        f"原方向: {'做多 LONG' if orig_dir == 'LONG' else '做空 SHORT'}\n"
-        f"反手为: <font color=\"warning\">{'做多 LONG' if rev_dir == 'LONG' else '做空 SHORT'}</font>\n"
-        f"反手入场: {entry:.6g} USDT\n"
-        f"反手止损: {stop:.6g} USDT\n"
-        f"反手止盈: {tp:.6g} USDT"
     )
 
 
@@ -786,42 +681,6 @@ def main():
                               f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%) <<<\n")
                     elif body_pct > -MIN_BODY_PCT:
                         print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% > {-MIN_BODY_PCT}%")
-
-                # ── 反手检测：这根K线是某持仓的信号K之后第1根时，判断EMA是否顺着 ──
-                if ENABLE_REVERSE:
-                    for key in list(rm.trades.keys()):
-                        t = rm.trades[key]
-                        if not t.position_open or t.reverse_done:
-                            continue
-                        if t.symbol != sym:
-                            continue
-                        if t.signal_bar_time is None or t.signal_ema is None:
-                            continue
-                        # 信号K之后第1根 = signal_bar_time + 15min
-                        if b["t"] != t.signal_bar_time + BAR_INTERVAL_MS:
-                            continue
-                        # 这根K线的 EMA 就是变量 ema，与 signal_ema 比较
-                        if t.direction == "LONG":
-                            along = ema > t.signal_ema
-                        else:
-                            along = ema < t.signal_ema
-                        t.reverse_done = True  # 只检查这一次
-                        if along:
-                            print(f"  [反手检查] {sym} {t.direction} 第1根EMA顺着，不反手")
-                            continue
-                        # 不顺：检查持仓时长是否已达阈值（避免误伤快速止盈单）
-                        hold_sec = time.time() - (t.entry_order_time or time.time())
-                        if hold_sec < REVERSE_CHECK_MIN_HOLD:
-                            print(f"  [反手检查] {sym} {t.direction} 第1根EMA不顺，"
-                                  f"但持仓仅 {hold_sec:.0f}s < {REVERSE_CHECK_MIN_HOLD}s，不反手")
-                            continue
-                        # 触发反手
-                        try:
-                            with _rm_lock:
-                                if rm.has_position_or_order(sym, t.direction):
-                                    reverse_trade(rm, t, o, c)
-                        except Exception as e:
-                            print(f"  [反手异常] {sym}: {e}")
 
         # 信号处理：开仓（加锁，与后台监控线程互斥）
         if signals:

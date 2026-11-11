@@ -33,5 +33,3 @@ cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（
 leverage: 10                           # 杠杆倍数（10x）
 cool_after_stops: 3                    # 连续 N 笔止损后进入冷静期
 cool_seconds: 9000                     # 冷静期时长（秒）= 2.5 小时
-enable_reverse: true                   # 反手开关：信号K之后第1根EMA不顺时平仓反手
-reverse_check_min_hold: 900            # 反手前原单需持仓>=该秒数（默认15分钟，避免误伤快速止盈单）

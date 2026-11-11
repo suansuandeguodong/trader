@@ -36,6 +36,7 @@ from reversal import EMA20Reversal
 from reversal_down import EMA20ReversalDown
 from broker import BinanceFutures
 from risk import RiskManager
+from pullback import PullbackManager
 from wecom_notifier import WeComNotifier
 import trade_log as tlog
 
@@ -69,6 +70,14 @@ CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
 LEVERAGE = CFG.get("leverage", 10)
 COOL_AFTER_STOPS = CFG.get("cool_after_stops", 3)
 COOL_SECONDS = CFG.get("cool_seconds", 9000)
+
+# 3m 回调入场
+ENABLE_PULLBACK = CFG.get("enable_pullback", True)
+PULLBACK_EMA_PERIOD = CFG.get("pullback_ema_period", 20)
+PULLBACK_WARMUP = CFG.get("pullback_warmup", 300)
+PULLBACK_WINDOW = CFG.get("pullback_window", 300)
+PULLBACK_WATCH_SECONDS = CFG.get("pullback_watch_seconds", 1800)
+PULLBACK_CHECK_EVERY = CFG.get("pullback_check_every", 60)
 
 BAR_INTERVAL_MS = 15 * 60 * 1000  # 15m
 _running = True
@@ -428,10 +437,101 @@ def _notify(markdown: str):
         _notifier.send_markdown(markdown)
 
 
+def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
+                          check_every: int = 60):
+    """
+    3m 回调监控线程：周期性检查「观察中」的 15m 信号，判定是否回调触碰 3m EMA20。
+
+    触发后调用 open_trade 以 3m EMA20 值挂限价单入场；
+    观察期超时则放弃该信号。
+    """
+    global _running
+    while _running:
+        try:
+            now_ms = int(time.time() * 1000)
+            # 快照观察中的信号（避免迭代中修改字典）
+            to_check = list(pullback_mgr.pending.items())
+            for key, ps in to_check:
+                sym, direction = ps.symbol, ps.direction
+                # 超时尽早判：跳过仍会继续拉数据的币
+                result = pullback_mgr.check_touch(sym, direction, now_ms)
+                if result is None:
+                    continue
+                if result.get("__timeout__"):
+                    pullback_mgr.remove(sym, direction)
+                    print(f"  [放弃] {sym} {direction} 观察期超时未回调，放弃信号")
+                    _notify(
+                        f"**⌛ 放弃信号 · {sym}**\n"
+                        f"\n"
+                        f"方向: {'做多 LONG' if direction == 'LONG' else '做空 SHORT'}\n"
+                        f"15m拐头后 {PULLBACK_WATCH_SECONDS // 60} 分钟内未回调到 3m EMA20，放弃。"
+                    )
+                    continue
+
+                # 触发：用 3m EMA20 作为入场价，开仓
+                entry = result["entry"]
+                stop = result["stop"]
+                tp = result["tp"]
+
+                # 先移除观察中状态（避免重复触发）
+                pullback_mgr.remove(sym, direction)
+
+                with _rm_lock:
+                    if rm.has_position_or_order(sym, direction):
+                        print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
+                        continue
+                    if not rm.can_open_new():
+                        print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
+                        continue
+                    if rm.in_cooling():
+                        print(f"  [冷静期] {sym} 连续止损后冷静中，跳过开仓")
+                        continue
+                    try:
+                        # 防御：3m 入场价与止损价不成立则放弃（做多 entry 必须 > stop）
+                        if direction == "LONG" and entry <= stop:
+                            print(f"  [放弃] {sym} 3m入场价 {entry:.6g} <= 止损 {stop:.6g}，放弃开仓")
+                            continue
+                        if direction == "SHORT" and entry >= stop:
+                            print(f"  [放弃] {sym} 3m入场价 {entry:.6g} >= 止损 {stop:.6g}，放弃开仓")
+                            continue
+                        # 触发入场通知
+                        _notify(
+                            f"**🎯 回踩到位 · {sym}**\n"
+                            f"\n"
+                            f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
+                            f"3m 已触碰 EMA20，入场价 {entry:.6g}。"
+                        )
+                        meta = {
+                            "bar_time": ps.sig_close_ms - BAR_INTERVAL_MS,
+                            "open": ps.sig_open,
+                            "close": ps.sig_close,
+                            "prev_open": ps.prev_open,
+                            "entry_source": "3m_ema20",
+                        }
+                        open_trade(rm, sym, direction, ps.sig_open, ps.sig_close,
+                                   meta, entry=entry, stop=stop, tp=tp)
+                    except Exception as e:
+                        print(f"  [开仓异常] {sym}: {e}")
+        except Exception as e:
+            print(f"  [3m监控线程] 异常: {e}")
+
+        # 分段 sleep，便于响应退出
+        for _ in range(check_every):
+            if not _running:
+                break
+            time.sleep(1)
+
+
 def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
-               meta: dict = None):
-    """按信号开仓。meta 为信号元数据（用于详细落盘）。"""
-    entry, stop, tp = rm.compute_prices(direction, o, c)
+               meta: dict = None, entry: float = None, stop: float = None,
+               tp: float = None):
+    """按信号开仓。meta 为信号元数据（用于详细落盘）。
+
+    entry/stop/tp 为可选：不传则用 15m 信号价计算（compute_prices），
+    传了（3m 回调入场场景）则直接用传入的三价。
+    """
+    if entry is None or stop is None or tp is None:
+        entry, stop, tp = rm.compute_prices(direction, o, c)
     qty = rm.compute_qty(sym, entry)
     if qty <= 0:
         print(f"  [跳过] {sym} 数量为 0，无法开仓")
@@ -574,6 +674,15 @@ def main():
     rev_up = EMA20Reversal(min_down_bars=MIN_DOWN_BARS)
     rev_down = EMA20ReversalDown(min_up_bars=MIN_UP_BARS)
 
+    # 3m 回调入场管理器（观察中状态 + 3m EMA20 触碰判定）
+    pullback_mgr = PullbackManager(
+        ema_period=PULLBACK_EMA_PERIOD,
+        window_size=PULLBACK_WINDOW,
+        warmup_limit=PULLBACK_WARMUP,
+        watch_seconds=PULLBACK_WATCH_SECONDS,
+        risk_reward=RISK_REWARD,
+    ) if ENABLE_PULLBACK else None
+
     print("预热滑动窗口（并发拉历史 K 线 + 还原状态机）...")
     t0 = time.time()
     warm = parallel_fetch(candidates, WARMUP_LIMIT, workers=MAX_WORKERS)
@@ -599,6 +708,16 @@ def main():
     monitor_thread.start()
     print("后台监控线程已启动（每 15 秒检查挂单成交 + 持仓）\n")
 
+    # 3m 回调监控线程（仅当启动 pullback 模式）
+    if ENABLE_PULLBACK and pullback_mgr is not None:
+        pb_thread = threading.Thread(
+            target=pullback_monitor_loop,
+            args=(rm, pullback_mgr, PULLBACK_CHECK_EVERY),
+            daemon=True,
+        )
+        pb_thread.start()
+        print(f"3m 回调监控线程已启动（每 {PULLBACK_CHECK_EVERY} 秒检查观察中的信号）\n")
+
     last_rescan = time.time()
     iteration = 0
 
@@ -610,7 +729,7 @@ def main():
         loop_start = time.time()
 
         print(f"[{_ts()}] 第{iteration}轮：拉取 {len(candidates)} 币最新 K线...")
-        data = parallel_fetch(candidates, 2, workers=MAX_WORKERS)
+        data = parallel_fetch(candidates, 3, workers=MAX_WORKERS)
         fetch_s = time.time() - loop_start
         print(f"[{_ts()}] 拉取完成 {len(data)}/{len(candidates)} 币, 耗时 {fetch_s:.1f}s")
 
@@ -621,7 +740,7 @@ def main():
         for sym, bars in data.items():
             if not bars:
                 continue
-            for b in bars:
+            for idx, b in enumerate(bars):
                 bar_close_ms = b["t"] + BAR_INTERVAL_MS
                 if bar_close_ms > now_ms + LEAD_SECONDS * 1000:
                     continue
@@ -631,6 +750,8 @@ def main():
                 new_closed += 1
                 o = b["o"]
                 c = b["c"]
+                # 信号K线前一根的开盘价（止损比较用）
+                prev_open = bars[idx - 1]["o"] if idx > 0 else None
 
                 # 向上拐头（做多）
                 up_before = rev_up.get_down_count(sym)
@@ -649,6 +770,7 @@ def main():
                             "down_count": up_before,
                             "body_pct": body_pct,
                             "ema_history": list(rev_up.get_ema_history(sym)),
+                            "prev_open": prev_open,
                         }
                         signals.append((sym, "LONG", o, c, meta))
                         tlog.log_signal(sym, "LONG", meta)
@@ -674,6 +796,7 @@ def main():
                             "up_count": down_before,
                             "body_pct": body_pct,
                             "ema_history": list(rev_down.get_ema_history(sym)),
+                            "prev_open": prev_open,
                         }
                         signals.append((sym, "SHORT", o, c, meta))
                         tlog.log_signal(sym, "SHORT", meta)
@@ -714,7 +837,24 @@ def main():
                               f"剩余 {remain/60:.1f} 分钟，跳过开仓")
                         continue
                     try:
-                        open_trade(rm, sym, direction, o, c, meta)
+                        if ENABLE_PULLBACK and pullback_mgr is not None:
+                            # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA20 再开仓
+                            prev_open = meta.get("prev_open") if meta else None
+                            sig_close_ms = (meta.get("bar_time") if meta else 0) + BAR_INTERVAL_MS
+                            ok = pullback_mgr.add_signal(
+                                sym, direction, o, c, prev_open, sig_close_ms)
+                            if ok:
+                                print(f"  [观察] {sym} {direction} 15m拐头，等待3m回调到EMA20")
+                                _notify(
+                                    f"**👀 等待回踩入场 · {sym}**\n"
+                                    f"\n"
+                                    f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
+                                    f"15m已拐头，等待价格回调到 3m EMA20 再挂单。"
+                                )
+                            else:
+                                print(f"  [跳过] {sym} {direction} 已在观察中，忽略重复")
+                        else:
+                            open_trade(rm, sym, direction, o, c, meta)
                     except Exception as e:
                         print(f"  [开仓异常] {sym}: {e}")
 
@@ -750,6 +890,8 @@ def main():
                     rev_up.reset(s)
                     rev_down.reset(s)
                     sema.reset(s)
+                    if pullback_mgr is not None:
+                        pullback_mgr.reset(s)
                 candidates = new_candidates
                 print(f"候选币数量: {len(candidates)} 个（新增 {len(added)}）\n")
             except Exception as e:

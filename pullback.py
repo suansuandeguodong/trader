@@ -169,8 +169,10 @@ class PullbackManager:
 
             if touched:
                 # 触发：入场价 = 触碰那根 3m K线【收盘后】算出的 EMA20
-                # （含触碰 K线自身的收盘价，符合策略注释第 13 行语义）
-                entry = ema_after
+                # （含触碰 K线自身的收盘价，符合策略注释第 13 行语义）。
+                # 若 push_close 因去重跳过返回 None（该 K线未推进），则退回到
+                # 触碰前的 EMA20，避免把 None 当作价格参与后续运算。
+                entry = ema_after if ema_after is not None else ema_before
                 ps.entered = True
                 # 计算止盈止损（止盈以入场价 entry 为基准）
                 stop, tp, half_body = self._compute_stop_tp(direction, ps, entry)

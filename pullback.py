@@ -33,6 +33,8 @@ class PendingSignal:
     # 15m 信号K线价格（用于止盈止损计算）
     sig_open: float
     sig_close: float
+    sig_low: float          # 信号K线最低价（做多止损比较用）
+    sig_high: float         # 信号K线最高价（做空止损比较用）
     prev_open: float        # 信号K线前一根的开盘价（止损比较用）
     sig_close_ms: int       # 信号K线 closeTime(ms)，观察期计时起点
     entered: bool = False   # 是否已触发入场（防重复）
@@ -62,15 +64,16 @@ class PullbackManager:
         return (symbol, direction)
 
     def add_signal(self, symbol: str, direction: str, sig_open: float,
-                   sig_close: float, prev_open: float, sig_close_ms: int) -> bool:
+                   sig_close: float, sig_low: float, sig_high: float,
+                   prev_open: float, sig_close_ms: int) -> bool:
         """登记一个 15m 拐头信号进入观察期。返回 False 表示该币同方向已在观察。"""
         k = self._key(symbol, direction)
         if k in self.pending:
             return False
         self.pending[k] = PendingSignal(
             symbol=symbol, direction=direction,
-            sig_open=sig_open, sig_close=sig_close, prev_open=prev_open,
-            sig_close_ms=sig_close_ms,
+            sig_open=sig_open, sig_close=sig_close, sig_low=sig_low,
+            sig_high=sig_high, prev_open=prev_open, sig_close_ms=sig_close_ms,
         )
         # 预热该 symbol 的 3m 窗口（若尚未初始化）
         self._ensure_3m_ready(symbol)
@@ -169,7 +172,8 @@ class PullbackManager:
         计算止盈/止损。
 
         止盈 = 入场价 ± 信号K线实体的一半（做多加、做空减）。
-        止损 = min(信号K线 open, 信号K线前一根 open)（做多取更低），做空取 max。
+        止损 = min(信号K线最低价, 前一根开盘价)（做多取更低），
+               max(信号K线最高价, 前一根开盘价)（做空取更高）。
         返回 (stop, tp)，未对齐。
         """
         o, c, prev = ps.sig_open, ps.sig_close, ps.prev_open
@@ -177,10 +181,10 @@ class PullbackManager:
 
         if direction == "LONG":
             tp = entry + half_body
-            stop = min(o, prev)
+            stop = min(ps.sig_low, prev)
         else:  # SHORT
             tp = entry - half_body
-            stop = max(o, prev)
+            stop = max(ps.sig_high, prev)
         return stop, tp
 
     # ── 生命周期 ──

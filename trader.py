@@ -799,9 +799,12 @@ def main():
                         if ENABLE_PULLBACK and pullback_mgr is not None:
                             # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA20 再开仓
                             prev_open = meta.get("prev_open") if meta else None
+                            sig_low = meta.get("low") if meta else None
+                            sig_high = meta.get("high") if meta else None
                             sig_close_ms = (meta.get("bar_time") if meta else 0) + BAR_INTERVAL_MS
                             ok = pullback_mgr.add_signal(
-                                sym, direction, o, c, prev_open, sig_close_ms)
+                                sym, direction, o, c, sig_low, sig_high,
+                                prev_open, sig_close_ms)
                             if ok:
                                 print(f"  [观察] {sym} {direction} 15m拐头，等待3m回调到EMA20")
                                 _notify(

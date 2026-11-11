@@ -424,7 +424,7 @@ def _notify(markdown: str):
 
 
 def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
-                          check_every: int = 60):
+                          check_every: int = 15):
     """
     3m 回调监控线程：周期性检查「观察中」的 15m 信号，判定是否回调触碰 3m EMA20。
 

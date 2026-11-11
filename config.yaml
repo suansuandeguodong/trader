@@ -36,4 +36,4 @@ pullback_ema_period: 20                # 3m 的 EMA 周期
 pullback_warmup: 300                   # 3m 预热拉取历史 K 线数
 pullback_window: 300                   # 3m 滑动窗口长度
 pullback_watch_seconds: 1800           # 观察期时长（秒）= 30 分钟，超时未回调则放弃信号
-pullback_check_every: 60               # 3m 监控轮询间隔（秒）
+pullback_check_every: 15               # 3m 监控轮询间隔（秒）

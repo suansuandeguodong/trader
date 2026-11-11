@@ -12,6 +12,7 @@
   D. 跨信号状态泄漏：remove 后 reset sema_3m
   E. 多轮轮询无未来 K线污染（QUSDT/ZEC 类误触发回归）
   F. 真实数据回放（依赖币安，验证近期案例，历史久远者拉不到数据属预期）
+  G. 手算基准：用独立手工推导的真值锚定代码输出（防「代码+测试一起错」）
 """
 import sys
 import io
@@ -295,6 +296,94 @@ try:
     check(f"F3 ZEC 做多应触发 [{why}]", r is not None, f"跳价={r}")
 except Exception as e:
     print(f"  ⚠️ 真实数据回放跳过（网络/数据不可用）: {e}")
+
+
+# ─────────────────────────────────────────────────────────────
+print()
+print("=" * 60)
+print("G. 手算基准：独立推导真值锚定代码")
+print("=" * 60)
+# 这些期望值全部手工推导，独立于代码实现，用于防止「代码和测试一起错」。
+
+# G1 EMA：20根全100 + 1根110 → EMA = 110*α + 100*(1-α)
+a = 2 / 21
+closes_g = [100.0] * 20 + [110.0]
+times_g = [START + i * BAR_MS for i in range(21)]
+sema_g = SlidingEMA(period=20, window_size=300, bar_interval_ms=BAR_MS)
+sema_g.init_symbol('G', closes_g, times_g)
+check("G1 EMA 手算=100.95238095",
+      abs(sema_g.get_ema('G') - (110 * a + 100 * (1 - a))) < 1e-12,
+      f"got={sema_g.get_ema('G')}")
+
+# G2 EMA 复杂序列手算
+vals_g = [100.0, 101.5, 99.3, 102.1, 98.8, 103.5, 97.2, 104.1, 96.9, 105.0,
+          95.5, 106.2, 94.8, 107.0, 93.9, 108.1, 92.7, 109.3, 91.5, 110.0,
+          89.9, 111.2, 88.4, 112.5, 87.6]
+def hand_ema(cs):
+    e = sum(cs[:20]) / 20
+    for x in cs[20:]:
+        e = x * a + e * (1 - a)
+    return e
+sema_g2 = SlidingEMA(period=20, window_size=300, bar_interval_ms=BAR_MS)
+times_g2 = [START + i * BAR_MS for i in range(len(vals_g))]
+sema_g2.init_symbol('G2', vals_g, times_g2)
+check("G2 EMA 复杂序列手算",
+      abs(sema_g2.get_ema('G2') - hand_ema(vals_g)) < 1e-12)
+
+# G3 止盈止损 手算锚定（做多 o=100 c=110 low=95 high=115 prev=105 entry=108）
+stop, tp, hb = mgr._compute_stop_tp('LONG',
+                                    PendingSignal('L', 'LONG', 100, 110, 95, 115, 105, 0),
+                                    entry=108)
+check("G3 做多 stop=95 tp=113 hb=5",
+      stop == 95 and tp == 113 and hb == 5,
+      f"stop={stop} tp={tp} hb={hb}")
+
+# G4 止盈止损 手算锚定（做空 o=110 c=100 low=95 high=115 prev=105 entry=102）
+stop, tp, hb = mgr._compute_stop_tp('SHORT',
+                                    PendingSignal('S', 'SHORT', 110, 100, 95, 115, 105, 0),
+                                    entry=102)
+check("G4 做空 stop=115 tp=97 hb=5",
+      stop == 115 and tp == 97 and hb == 5,
+      f"stop={stop} tp={tp} hb={hb}")
+
+# G5 触碰判定 手算：前20根100，第21根90（做多 low 跌穿），ema_after=99.047619
+import importlib as _il
+_il.reload(market)
+bars_g5 = []
+for i in range(25):
+    c = 100.0 if i < 20 else (90.0 if i == 20 else 91.0)
+    o = 100.0 if i <= 20 else 90.0
+    bars_g5.append({'t': START + i * BAR_MS, 'o': o, 'h': max(o, c) + 1,
+                    'l': min(o, c) - 1, 'c': c, 'v': 0})
+_current_bars = bars_g5
+market.get_3m_klines = fake_get_3m_klines
+mgr_g5 = new_mgr()
+sig_close_ms = START + 20 * BAR_MS
+ps_g5 = PendingSignal('Y', 'LONG', 100, 100, 99, 101, 99, sig_close_ms)
+mgr_g5.pending[('Y', 'LONG')] = ps_g5
+r_g5 = mgr_g5.check_touch('Y', 'LONG', START + 22 * BAR_MS)
+ema_after_hand = 90 * a + 100 * (1 - a)
+check("G5 做多触碰 entry=ema_after=99.047619",
+      r_g5 is not None and abs(r_g5['entry'] - ema_after_hand) < 1e-9,
+      f"entry={r_g5['entry'] if r_g5 else None} 期望={ema_after_hand}")
+
+# G6 做空触碰 手算：前20根100，第21根101上穿，ema_after=100.095238
+_il.reload(market)
+bars_g6 = []
+for i in range(25):
+    c = 100.0 if i < 20 else (101.0 if i == 20 else 100.5)
+    bars_g6.append({'t': START + i * BAR_MS, 'o': 100.0, 'h': max(100.0, c) + 0.5,
+                    'l': min(100.0, c) - 0.5, 'c': c, 'v': 0})
+_current_bars = bars_g6
+market.get_3m_klines = fake_get_3m_klines
+mgr_g6 = new_mgr()
+ps_g6 = PendingSignal('Z', 'SHORT', 100, 100, 99, 101, 100, START + 20 * BAR_MS)
+mgr_g6.pending[('Z', 'SHORT')] = ps_g6
+r_g6 = mgr_g6.check_touch('Z', 'SHORT', START + 22 * BAR_MS)
+ema_after_hand6 = 101 * a + 100 * (1 - a)
+check("G6 做空触碰 entry=ema_after=100.095238",
+      r_g6 is not None and abs(r_g6['entry'] - ema_after_hand6) < 1e-9,
+      f"entry={r_g6['entry'] if r_g6 else None} 期望={ema_after_hand6}")
 
 
 # ─────────────────────────────────────────────────────────────

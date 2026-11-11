@@ -37,6 +37,7 @@ class BinanceFutures:
         self._symbol_info_ts = 0.0
         # 本地时间与币安服务器时间的偏移量（毫秒）。启动时校准，避免 timestamp 超前后报 -1021。
         self._time_offset_ms = 0
+        self._last_calibrate_ts = 0.0  # 上次校准的本地时刻（秒），用于周期性重校准
         self._calibrate_time()
 
     def _calibrate_time(self):
@@ -57,7 +58,15 @@ class BinanceFutures:
             self._time_offset_ms = 0
 
     def _server_timestamp(self) -> int:
-        """返回修正后的、接近币安服务器时间的毫秒时间戳。"""
+        """返回修正后的、接近币安服务器时间的毫秒时间戳。
+
+        长期运行时本地时钟与币安服务器时钟会缓慢漂移，若只在启动时校准一次，
+        漂移累积会导致签名 timestamp 超差（-1021）。这里在距上次校准超过
+        30 分钟后自动重校准，保证长期运行签名仍然有效。
+        """
+        if time.time() - self._last_calibrate_ts >= 1800:
+            self._calibrate_time()
+            self._last_calibrate_ts = time.time()
         return int(time.time() * 1000) + self._time_offset_ms
 
     # ── 签名请求 ──

@@ -27,6 +27,9 @@ from typing import Optional, Dict, Any
 LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                         "trade_history.jsonl")
 
+# 日志文件大小上限（字节）。超过则归档，避免长期运行磁盘无限增长。
+LOG_MAX_BYTES = 50 * 1024 * 1024  # 50 MB
+
 
 def _now_iso() -> str:
     """本地时区 ISO 时间字符串（含时区）。"""
@@ -43,10 +46,30 @@ def _utc_iso(ms: Optional[int]) -> Optional[str]:
         return None
 
 
+def _rotate_if_needed():
+    """日志文件超过阈值时归档，避免长期运行磁盘无限增长。"""
+    try:
+        if not os.path.exists(LOG_PATH):
+            return
+        if os.path.getsize(LOG_PATH) >= LOG_MAX_BYTES:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            archive = LOG_PATH.replace(".jsonl", f"-{ts}.jsonl")
+            # 若同一秒内多次触发，追加序号避免覆盖
+            i = 1
+            while os.path.exists(archive):
+                archive = LOG_PATH.replace(".jsonl", f"-{ts}-{i}.jsonl")
+                i += 1
+            os.rename(LOG_PATH, archive)
+            print(f"  [日志] 已归档为 {os.path.basename(archive)}")
+    except Exception as e:
+        print(f"  [日志] 轮转失败: {e}")
+
+
 def _append(record: Dict[str, Any]):
     """追加一条记录到 JSONL 文件（立即 flush + fsync）。"""
     line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
     try:
+        _rotate_if_needed()
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write(line)
             f.flush()

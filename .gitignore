@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 *.log
 trade_history.jsonl
+trade_history-*.jsonl

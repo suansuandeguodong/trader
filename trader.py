@@ -153,88 +153,110 @@ def sync_positions_from_exchange(rm: RiskManager):
             if not t.position_open:
                 continue
             sym, pos_side = key
-            if (sym, pos_side) not in exchange_keys:
-                print(f"  [平仓] {sym} {t.direction} 交易所已无该方向仓位"
-                      f"（止盈/止损触发），清理残留")
-
-                # 判定止损/止盈：拉该 symbol 的成交，按方向+时间窗口汇总 realizedPnl。
-                # 关键：一笔平仓可能分多笔撮合，每笔子成交各带一份 realizedPnl，
-                # 必须对「本笔持仓开仓之后、且同方向」的所有平仓成交求和，才是整笔真实盈亏。
-                realized = None
+            if (sym, pos_side) in exchange_keys:
+                continue
+            # 每笔平仓处理独立 try，避免单笔异常（如撤单 API 失败）影响其它持仓的平仓通知与清理
+            try:
+                _handle_one_close(rm, t, sym, pos_side)
+            except Exception as e:
+                print(f"  [平仓处理] {sym} {t.direction} 异常: {e}")
+                # 即便处理异常，仍尽力移除本地记录，避免下轮重复检测造成死循环
                 try:
-                    # 时间窗口起点 = 本笔开仓挂单时间（回退到信号 K线时间或一个较大窗口）
-                    open_ms = int(t.entry_order_time * 1000) if t.entry_order_time else 0
-                    # 拉最近 N 笔成交，反向（新→旧）累加同方向的 realizedPnl，
-                    # 直到越过开仓时间窗口（或达到足够数量）。
-                    trades = rm.broker.get_user_trades(sym, limit=50)
-                    total = 0.0
-                    found = False
-                    for tr in reversed(trades):
-                        tr_time = tr.get("time")
-                        tr_side = tr.get("positionSide", "BOTH")
-                        # 只累积「本笔方向」的成交（LONG/SHORT 精确匹配）
-                        if tr_side != t.direction:
-                            continue
-                        # 已越过本笔开仓时间窗口（成交从新到旧遍历），停止
-                        if open_ms and tr_time and int(tr_time) < open_ms:
-                            break
-                        rp = float(tr.get("realizedPnl", 0) or 0)
-                        if abs(rp) > 1e-9:
-                            total += rp
-                            found = True
-                    if found:
-                        realized = total
+                    rm.remove_trade(sym, t.direction)
                 except Exception:
-                    realized = None
-
-                is_stop = False
-                close_reason = "平仓（盈亏未知）"
-                if realized is not None:
-                    is_stop = realized < 0
-                    close_reason = "止损触发" if is_stop else "止盈触发"
-
-                # 计算持仓时长（秒），附带进平仓记录
-                hold_sec = None
-                if t.entry_order_time:
-                    hold_sec = round(time.time() - t.entry_order_time, 1)
-                tlog.log_close(sym, t.direction, getattr(t, "trade_id", ""),
-                               close_reason,
-                               price=t.entry_price,
-                               pnl=realized,
-                               close_time_ms=int(time.time() * 1000))
-                if hold_sec is not None:
-                    # 补充持仓时长到已写记录
-                    tlog.log_position(sym, t.direction, getattr(t, "trade_id", ""),
-                                      {"hold_sec": hold_sec, "entry_price": t.entry_price,
-                                       "stop_price": t.stop_price, "tp_price": t.take_profit_price})
-
-                # 企微平仓通知（止盈/止损）
-                if realized is not None:
-                    emoji = "❌" if is_stop else "✅"
-                    _notify(
-                        f"**{emoji} {close_reason} · {sym}**\n"
-                        f"\n"
-                        f"方向: {'做多 LONG' if t.direction == 'LONG' else '做空 SHORT'}\n"
-                        f"入场价: {t.entry_price:.6g} USDT\n"
-                        f"已实现盈亏: <font color=\"{'warning' if is_stop else 'info'}\">"
-                        f"{realized:+.4f} USDT</font>"
-                        + (f"\n持仓时长: {hold_sec/60:.1f} 分钟" if hold_sec else "")
-                    )
-
-                # 撤销残留单：
-                #   止损单是 Algo 条件单 -> cancel_algo_order
-                #   止盈单是普通限价单 -> cancel_order
-                # 两单一剩另一，需全部撤掉。
-                if t.stop_order_id:
-                    rm.broker.cancel_algo_order(sym, t.stop_order_id)
-                if t.tp_order_id:
-                    rm.broker.cancel_order(sym, t.tp_order_id)
-
-                # 兜底：撤销该 symbol 的所有普通挂单（防遗漏）
-                rm.broker.cancel_all_open_orders(sym)
-                rm.remove_trade(sym, t.direction)
+                    pass
     except Exception as e:
         print(f"  [同步] 异常: {e}")
+
+
+def _handle_one_close(rm: RiskManager, t, sym: str, pos_side: str):
+    """处理一笔「交易所已无该方向仓位」的平仓：算盈亏 → 记日志 → 通知 → 撤残留单 → 移除。"""
+    print(f"  [平仓] {sym} {t.direction} 交易所已无该方向仓位（止盈/止损触发），清理残留")
+
+    # 判定止损/止盈：拉该 symbol 成交，汇总「本笔方向」的非零 realizedPnl。
+    # 关键：币安 userTrades 只有「平仓成交」带非零 realizedPnl（开仓成交为 0），
+    # 所以只要是本方向(positionSide==direction)的非零 realizedPnl，就是本笔
+    # 平仓的精确已实现盈亏（交易所已算好），直接求和即可，无需时间戳反推。
+    realized = None
+    try:
+        # 时间窗口起点 = 开仓挂单时间往前留 1 分钟余量（覆盖挂单前已成交）
+        # 若无挂单时间，退回到前 1 小时（足够覆盖一笔持仓的生命周期）。
+        if t.entry_order_time:
+            start_ms = int(t.entry_order_time * 1000) - 60 * 1000
+        else:
+            start_ms = int(time.time() * 1000) - 3600 * 1000
+        # 用 startTime 精确限定，避免拉满 50 笔时漏掉本笔平仓成交
+        trades = rm.broker.get_user_trades(sym, limit=100, start_time=start_ms)
+        total = 0.0
+        found = False
+        for tr in trades:
+            tr_side = tr.get("positionSide", "BOTH")
+            # 只累积「本笔方向」的成交（LONG/SHORT 精确匹配）
+            if tr_side != t.direction:
+                continue
+            rp = float(tr.get("realizedPnl", 0) or 0)
+            # 平仓成交带非零 realizedPnl，求和即为本笔精确盈亏
+            if abs(rp) > 1e-9:
+                total += rp
+                found = True
+        if found:
+            realized = total
+    except Exception as e:
+        print(f"  [盈亏] {sym} 拉取 realizedPnl 失败: {e}")
+        realized = None
+
+    is_stop = False
+    close_reason = "平仓（盈亏未知）"
+    if realized is not None:
+        is_stop = realized < 0
+        close_reason = "止损触发" if is_stop else "止盈触发"
+
+    # 计算持仓时长（秒），附带进平仓记录
+    hold_sec = None
+    if t.entry_order_time:
+        hold_sec = round(time.time() - t.entry_order_time, 1)
+    tlog.log_close(sym, t.direction, getattr(t, "trade_id", ""),
+                   close_reason,
+                   price=t.entry_price,
+                   pnl=realized,
+                   close_time_ms=int(time.time() * 1000))
+    if hold_sec is not None:
+        # 补充持仓时长到已写记录
+        tlog.log_position(sym, t.direction, getattr(t, "trade_id", ""),
+                          {"hold_sec": hold_sec, "entry_price": t.entry_price,
+                           "stop_price": t.stop_price, "tp_price": t.take_profit_price})
+
+    # 企微平仓通知。无论盈亏是否算出，都必须发通知（避免「平仓了但没通知」）。
+    # 盈亏算不出时，仍发通知但盈亏标注「未知」。
+    if realized is not None:
+        emoji = "❌" if is_stop else "✅"
+    else:
+        emoji = "⚪"
+    pnl_str = (f"{realized:+.4f} USDT"
+               if realized is not None else "未知（未取到盈亏）")
+    color = ("warning" if is_stop else "info") if realized is not None else "comment"
+    _notify(
+        f"**{emoji} {close_reason} · {sym}**\n"
+        f"\n"
+        f"方向: {'做多 LONG' if t.direction == 'LONG' else '做空 SHORT'}\n"
+        f"入场价: {t.entry_price:.6g} USDT\n"
+        f"已实现盈亏: <font color=\"{color}\">"
+        f"{pnl_str}</font>"
+        + (f"\n持仓时长: {hold_sec/60:.1f} 分钟" if hold_sec else "")
+    )
+
+    # 撤销残留单：
+    #   止损单是 Algo 条件单 -> cancel_algo_order
+    #   止盈单是普通限价单 -> cancel_order
+    # 两单一剩另一，需全部撤掉。
+    if t.stop_order_id:
+        rm.broker.cancel_algo_order(sym, t.stop_order_id)
+    if t.tp_order_id:
+        rm.broker.cancel_order(sym, t.tp_order_id)
+
+    # 兜底：撤销该 symbol 的所有普通挂单（防遗漏）
+    rm.broker.cancel_all_open_orders(sym)
+    rm.remove_trade(sym, t.direction)
 
 
 def manage_pending_orders(rm: RiskManager):

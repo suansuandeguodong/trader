@@ -341,9 +341,12 @@ def _place_stop_tp(rm: RiskManager, t, qty=None, fill_price=None):
 
     # 基于成交价重算止盈价（止损价保持 = 信号 open 不变）
     stop = t.stop_price
-    if t.fixed_tp:
-        # 固定止盈（3m回调策略）：止盈价已在开仓时定死，不随成交价重算
-        tp = t.take_profit_price
+    if t.half_body is not None:
+        # 3m回调策略：止盈 = 真实成交价 ± 信号实体的一半
+        if t.direction == "LONG":
+            tp = fill_price + t.half_body
+        else:  # SHORT
+            tp = fill_price - t.half_body
     else:
         if t.direction == "LONG":
             tp = fill_price + (fill_price - stop) / 2.0
@@ -455,6 +458,7 @@ def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                 entry = result["entry"]
                 stop = result["stop"]
                 tp = result["tp"]
+                half_body = result["half_body"]
 
                 # 先移除观察中状态（避免重复触发）
                 pullback_mgr.remove(sym, direction)
@@ -489,7 +493,8 @@ def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                             "entry_source": "3m_ema20",
                         }
                         open_trade(rm, sym, direction, ps.sig_open, ps.sig_close,
-                                   meta, entry=entry, stop=stop, tp=tp)
+                                   meta, entry=entry, stop=stop, tp=tp,
+                                   half_body=half_body)
                     except Exception as e:
                         print(f"  [开仓异常] {sym}: {e}")
         except Exception as e:
@@ -504,13 +509,13 @@ def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
 
 def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
                meta: dict = None, entry: float = None, stop: float = None,
-               tp: float = None):
+               tp: float = None, half_body: float = None):
     """按信号开仓。meta 为信号元数据（用于详细落盘）。
 
     entry/stop/tp 为可选：不传则用 15m 信号价计算（compute_prices），
-    传了（3m 回调入场场景）则直接用传入的三价，且止盈价固定（成交后不重算）。
+    传了（3m 回调入场场景）则直接用传入的三价。
+    half_body: 信号K线实体的一半（3m策略），非 None 时成交后用真实成交价重算止盈。
     """
-    fixed_tp = (entry is not None and stop is not None and tp is not None)
     if entry is None or stop is None or tp is None:
         entry, stop, tp = rm.compute_prices(direction, o, c)
     qty = rm.compute_qty(sym, entry)
@@ -568,7 +573,7 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
     side = rm.side_for_entry(direction)
     pos_side = rm.position_side(direction)
     # 注册交易状态（先注册，再挂单）
-    t = rm.register_trade(sym, direction, entry, stop, tp, qty, fixed_tp=fixed_tp)
+    t = rm.register_trade(sym, direction, entry, stop, tp, qty, half_body=half_body)
     if t is None:
         print(f"  [跳过] {sym} {direction} 已在持仓/挂单中，拒绝重复开仓")
         return

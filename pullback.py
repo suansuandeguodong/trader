@@ -130,11 +130,7 @@ class PullbackManager:
         if now_ms - ps.sig_close_ms >= self.watch_seconds * 1000:
             return {"__timeout__": True}
 
-        # 拉最新 3m K线。拉取足够多的根数（窗口长度），确保能够：
-        #  1) 重建信号收盘前已存在的 3m EMA20 基线；
-        #  2) 逐根推进「信号收盘后」的已收盘 3m K线做触碰判定。
-        # 若只拉 3 根，会因 push_close 的去重而跳过 K线，导致 EMA 滞后/错乱
-        # （实盘中 ONE 入场价 0.00171389 vs 正确 0.0015698，即由此造成）。
+        # 拉全量 3m K线（覆盖信号收盘前基线 + 信号收盘后的回踩判定区间）。
         try:
             from market import get_3m_klines
             bars = get_3m_klines(symbol, limit=self.window_size)
@@ -144,49 +140,53 @@ class PullbackManager:
         if not bars:
             return None
 
-        # 逐根推进 3m 窗口，并对「已收盘的触碰 K线」做判定。
-        # 关键：跳过「进行中」的 3m K线（其 closeTime 仍在未来）——
-        # 它的收盘价是实时快照、不稳定，既不能算 EMA 也不能做触碰判定，
-        # 严格遵循「3m K线收盘后确认」的语义。
+        # 关键：触碰判定必须用「独立重建的、按时间顺序推进」的 EMA，且一旦触碰就返回，
+        # 绝不复用跨轮累积推进的 sema_3m 持久状态——否则前几轮已把 EMA 推进到很晚，
+        # 本轮回头判定「信号收盘后早期 K线」时，用的 EMA 已被未来 K线污染（见 QUSDT
+        # 做空在 22:36 才触发、入场价 0.0286 却是 22:15 那根的 EMA，实为 22:33 的值）。
+
+        # 1) 重建「信号收盘时刻」的 EMA 基线：用信号收盘前已收盘的 3m 收盘价独立计算。
+        baseline = SlidingEMA(period=self.ema_period,
+                              window_size=self.window_size,
+                              bar_interval_ms=3 * 60 * 1000)
+        base_closes = [b["c"] for b in bars
+                       if b["t"] + 3 * 60 * 1000 <= ps.sig_close_ms]
+        base_times = [b["t"] for b in bars
+                      if b["t"] + 3 * 60 * 1000 <= ps.sig_close_ms]
+        baseline.init_symbol(symbol, base_closes, base_times)
+
+        # 2) 从「信号收盘后」起，按时间顺序逐根推进已收盘 3m K线，触碰即返回。
         for b in bars:
             close_ms = int(b["t"]) + 3 * 60 * 1000
-            is_closed = close_ms <= now_ms
-            if not is_closed:
-                continue  # 进行中的 K线：本轮跳过，等它收盘
-
-            # 只对「信号K线收盘之后」的已收盘 3m K线做触碰判定
+            if close_ms > now_ms:
+                continue  # 进行中/未来的 K线：本轮跳过，等它收盘
             if b["t"] < ps.sig_close_ms:
-                # 早于信号K线收盘的 K线仍需推进 EMA（保持基线正确），但不判定触碰
-                self.sema_3m.push_close(symbol, b["t"], b["c"])
-                continue
+                continue  # 信号收盘前的 K线：已包含在 baseline 里，跳过
 
-            # 触碰判定用「推进前的 EMA20」作为参照均线，避免用「触碰K线自身的收盘价」
-            # 推进后的 EMA 做判定（那会把入场价拉偏，见 ONE/AKE 的异常高价）。
-            ema_before = self.sema_3m.get_ema(symbol)
-            # 用本根收盘价推进 EMA（供后续 K线继续使用）
-            ema_after = self.sema_3m.push_close(symbol, b["t"], b["c"])
+            ema_before = baseline.get_ema(symbol)
             if ema_before is None:
+                # 基线不足（历史 K线少于 period），继续推进直到足够
+                baseline.push_close(symbol, b["t"], b["c"])
                 continue
 
             low = b["l"]
             high = b["h"]
-
             if direction == "LONG":
                 touched = low <= ema_before
             else:  # SHORT
                 touched = high >= ema_before
 
             if touched:
-                # 触发：入场价 = 触碰那根 3m K线【收盘后】算出的 EMA20
-                # （含触碰 K线自身的收盘价，符合策略注释第 13 行语义）。
-                # 若 push_close 因去重跳过返回 None（该 K线未推进），则退回到
-                # 触碰前的 EMA20，避免把 None 当作价格参与后续运算。
+                # 入场价 = 触碰那根 3m K线【收盘后】算出的 EMA20（含触碰 K线自身收盘价）。
+                ema_after = baseline.push_close(symbol, b["t"], b["c"])
                 entry = ema_after if ema_after is not None else ema_before
                 ps.entered = True
-                # 计算止盈止损（止盈以入场价 entry 为基准）
                 stop, tp, half_body = self._compute_stop_tp(direction, ps, entry)
                 return {"entry": entry, "stop": stop, "tp": tp,
                         "half_body": half_body, "touch_bar_time": b["t"]}
+
+            # 未触碰：本轮 K线收盘价推进 EMA，供下一根继续判定
+            baseline.push_close(symbol, b["t"], b["c"])
 
         return None
 

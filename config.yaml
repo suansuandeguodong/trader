@@ -27,11 +27,8 @@ lead_seconds: 15                       # 15m K 线收盘前提前触发秒数
 order_notional_usdt: 108.0             # 每笔名义仓位（USDT）
 risk_reward_ratio: 2.0                 # 盈亏比（止损:止盈 = 2:1，即亏2赚1）
 max_positions: 15                      # 最大同时持仓数
-max_long_signals_per_bar: 6            # 同一根K线同时触发做多信号 >= 该值时，本轮所有做多信号都不做（防诱多团灭）
 cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（秒）= 15 分钟
 leverage: 10                           # 杠杆倍数（10x）
-cool_after_stops: 3                    # 连续 N 笔止损后进入冷静期
-cool_seconds: 9000                     # 冷静期时长（秒）= 2.5 小时
 
 # ============ 3m 回调入场 ============
 enable_pullback: true                  # 开关：15m拐头后等3m回调到EMA20再入场（false则退回原"信号即挂单"）

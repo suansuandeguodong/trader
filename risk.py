@@ -43,8 +43,7 @@ class RiskManager:
 
     def __init__(self, broker: BinanceFutures, notional_usdt: float = 108.0,
                  risk_reward: float = 2.0, max_positions: int = 30,
-                 cancel_timeout_sec: int = 900,
-                 cool_after_stops: int = 3, cool_seconds: float = 2.5 * 3600):
+                 cancel_timeout_sec: int = 900):
         self.broker = broker
         self.notional_usdt = notional_usdt
         self.risk_reward = risk_reward
@@ -52,12 +51,6 @@ class RiskManager:
         self.cancel_timeout_sec = cancel_timeout_sec
         # 当前活跃的交易（挂单中 + 持仓中），key 为 (symbol, position_side)
         self.trades: Dict[tuple, Trade] = {}
-
-        # ── 连续止损冷静期 ──
-        self.cool_after_stops = cool_after_stops   # 连续 N 笔止损后触发冷静期
-        self.cool_seconds = cool_seconds          # 冷静期时长（秒），默认 2.5h
-        self.consecutive_stops = 0                # 当前连续止损笔数
-        self.cool_until = 0.0                     # 冷静期结束时间戳（秒），0 表示不在冷静期
 
     # ── 规则计算 ──
     def compute_prices(self, direction: str, open_price: float,
@@ -131,39 +124,3 @@ class RiskManager:
 
     def remove_trade(self, symbol: str, direction: str):
         self.trades.pop(self._key(symbol, direction), None)
-
-    # ── 连续止损冷静期 ──
-    def in_cooling(self) -> bool:
-        """是否处于冷静期（当前时间 < 冷静期结束时间）。"""
-        import time as _time
-        return self.cool_until > 0 and _time.time() < self.cool_until
-
-    def cool_remaining(self) -> float:
-        """冷静期还剩多少秒（不在冷静期则为 0）。"""
-        import time as _time
-        if not self.in_cooling():
-            return 0.0
-        return max(0.0, self.cool_until - _time.time())
-
-    def _reset_stop_counter(self):
-        self.consecutive_stops = 0
-
-    def on_stop_loss(self, open_time: float):
-        """
-        记录一笔止损平仓。open_time 保留仅为接口兼容（原为记录开仓时间）。
-        当连续止损达到阈值时，进入冷静期，冷静期起点 = 第 N 笔止损平仓发生的当前时刻。
-        """
-        self.consecutive_stops += 1
-
-        if self.consecutive_stops >= self.cool_after_stops:
-            # 冷静期从「第 N 笔止损平仓发生的当前时刻」起算 cool_seconds 秒。
-            import time as _time
-            self.cool_until = _time.time() + self.cool_seconds
-            # 重置计数，避免冷静期内反复触发
-            self._reset_stop_counter()
-            return True  # 表示刚触发了冷静期
-        return False
-
-    def on_profit(self):
-        """记录一笔盈利（止盈）平仓，重置连续止损计数。"""
-        self._reset_stop_counter()

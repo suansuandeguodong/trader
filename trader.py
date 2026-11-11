@@ -64,11 +64,8 @@ LEAD_SECONDS = CFG.get("lead_seconds", 15)
 NOTIONAL_USDT = CFG.get("order_notional_usdt", 108.0)
 RISK_REWARD = CFG.get("risk_reward_ratio", 2.0)
 MAX_POSITIONS = CFG.get("max_positions", 15)
-MAX_LONG_SIGNALS_PER_BAR = CFG.get("max_long_signals_per_bar", 6)
 CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
 LEVERAGE = CFG.get("leverage", 10)
-COOL_AFTER_STOPS = CFG.get("cool_after_stops", 3)
-COOL_SECONDS = CFG.get("cool_seconds", 9000)
 
 # 3m 回调入场
 ENABLE_PULLBACK = CFG.get("enable_pullback", True)
@@ -210,23 +207,6 @@ def sync_positions_from_exchange(rm: RiskManager):
                     tlog.log_position(sym, t.direction, getattr(t, "trade_id", ""),
                                       {"hold_sec": hold_sec, "entry_price": t.entry_price,
                                        "stop_price": t.stop_price, "tp_price": t.take_profit_price})
-
-                # 连续止损冷静期统计
-                if realized is not None:
-                    if is_stop:
-                        open_t = t.entry_order_time if t.entry_order_time else time.time()
-                        triggered = rm.on_stop_loss(open_t)
-                        if triggered:
-                            print(f"  [冷静期] 连续 {rm.cool_after_stops} 笔止损，"
-                                  f"进入冷静期 {rm.cool_seconds/3600:.1f} 小时")
-                            _notify(
-                                f"**🛑 连续止损冷静期**\n"
-                                f"\n"
-                                f"连续 <font color=\"warning\">{rm.cool_after_stops}</font> 笔止损，"
-                                f"进入冷静期 {rm.cool_seconds/3600:.1f} 小时，暂停开新仓。"
-                            )
-                    else:
-                        rm.on_profit()
 
                 # 企微平仓通知（止盈/止损）
                 if realized is not None:
@@ -486,9 +466,6 @@ def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                     if not rm.can_open_new():
                         print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
                         continue
-                    if rm.in_cooling():
-                        print(f"  [冷静期] {sym} 连续止损后冷静中，跳过开仓")
-                        continue
                     try:
                         # 防御：3m 入场价与止损价不成立则放弃（做多 entry 必须 > stop）
                         if direction == "LONG" and entry <= stop:
@@ -647,9 +624,7 @@ def main():
     broker = BinanceFutures(api_key, api_secret, proxy=proxy, testnet=testnet)
     rm = RiskManager(broker, notional_usdt=NOTIONAL_USDT,
                      risk_reward=RISK_REWARD, max_positions=MAX_POSITIONS,
-                     cancel_timeout_sec=CANCEL_TIMEOUT_SEC,
-                     cool_after_stops=COOL_AFTER_STOPS,
-                     cool_seconds=COOL_SECONDS)
+                     cancel_timeout_sec=CANCEL_TIMEOUT_SEC)
 
     # 企微通知（开仓/平仓/风控）
     global _notifier
@@ -812,33 +787,13 @@ def main():
         # 信号处理：开仓（加锁，与后台监控线程互斥）
         if signals:
             print(f"[{_ts()}] 本轮共 {len(signals)} 个信号，处理开仓...")
-            # 统计本轮做多信号数，超过阈值则本轮所有做多信号都不做（防诱多团灭）
-            long_count = sum(1 for s in signals if s[1] == "LONG")
-            skip_long = long_count >= MAX_LONG_SIGNALS_PER_BAR
-            if skip_long:
-                print(f"  [风控] 本轮做多信号 {long_count} 个 >= {MAX_LONG_SIGNALS_PER_BAR}，"
-                      f"跳过全部做多信号（疑似诱多）")
-                _notify(
-                    f"**⚠️ 防诱多风控**\n"
-                    f"\n"
-                    f"本轮做多信号 <font color=\"warning\">{long_count}</font> 个 "
-                    f">= {MAX_LONG_SIGNALS_PER_BAR}，跳过全部做多信号（疑似诱多团灭）。"
-                )
             with _rm_lock:
                 for sym, direction, o, c, meta in signals:
-                    if direction == "LONG" and skip_long:
-                        print(f"  [跳过] {sym} 做多信号因同时触发过多被过滤")
-                        continue
                     if rm.has_position_or_order(sym, direction):
                         print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
                         continue
                     if not rm.can_open_new():
                         print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
-                        continue
-                    if rm.in_cooling():
-                        remain = rm.cool_remaining()
-                        print(f"  [冷静期] {sym} {direction} 连续止损后冷静中，"
-                              f"剩余 {remain/60:.1f} 分钟，跳过开仓")
                         continue
                     try:
                         if ENABLE_PULLBACK and pullback_mgr is not None:

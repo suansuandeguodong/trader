@@ -59,8 +59,6 @@ class RiskManager:
         self.cool_seconds = cool_seconds          # 冷静期时长（秒），默认 2.5h
         self.consecutive_stops = 0                # 当前连续止损笔数
         self.cool_until = 0.0                     # 冷静期结束时间戳（秒），0 表示不在冷静期
-        # 用于计算「3 笔里最早开仓时间」的止损开仓时间列表（最多保留 cool_after_stops 个）
-        self._stop_open_times: list = []
 
     # ── 规则计算 ──
     def compute_prices(self, direction: str, open_price: float,
@@ -151,21 +149,18 @@ class RiskManager:
 
     def _reset_stop_counter(self):
         self.consecutive_stops = 0
-        self._stop_open_times = []
 
     def on_stop_loss(self, open_time: float):
         """
-        记录一笔止损平仓。open_time 为这笔止损对应仓位的开仓时间。
-        当连续止损达到阈值时，进入冷静期，冷静期起点 = 这 N 笔中最早开仓时间。
+        记录一笔止损平仓。open_time 保留仅为接口兼容（原为记录开仓时间）。
+        当连续止损达到阈值时，进入冷静期，冷静期起点 = 第 N 笔止损平仓发生的当前时刻。
         """
-        self._stop_open_times.append(open_time)
-        if len(self._stop_open_times) > self.cool_after_stops:
-            self._stop_open_times.pop(0)
-        self.consecutive_stops = len(self._stop_open_times)
+        self.consecutive_stops += 1
 
         if self.consecutive_stops >= self.cool_after_stops:
-            earliest = min(self._stop_open_times)
-            self.cool_until = earliest + self.cool_seconds
+            # 冷静期从「第 N 笔止损平仓发生的当前时刻」起算 cool_seconds 秒。
+            import time as _time
+            self.cool_until = _time.time() + self.cool_seconds
             # 重置计数，避免冷静期内反复触发
             self._reset_stop_counter()
             return True  # 表示刚触发了冷静期

@@ -52,7 +52,7 @@ EMA_PERIOD = CFG.get("ema_period", 20)
 MIN_DOWN_BARS = CFG.get("min_down_bars", 8)
 MIN_UP_BARS = CFG.get("min_up_bars", 8)
 MIN_BODY_PCT = CFG.get("min_body_pct", 1.0)
-MAX_BODY_PCT = CFG.get("max_body_pct", 3.5)
+MAX_BODY_PCT = CFG.get("max_body_pct", 3.0)
 WINDOW_SIZE = CFG.get("window_size", 300)
 WARMUP_LIMIT = CFG.get("warmup_limit", 500)
 MAX_WORKERS = CFG.get("max_workers", 20)
@@ -154,15 +154,33 @@ def sync_positions_from_exchange(rm: RiskManager):
                 print(f"  [平仓] {sym} {t.direction} 交易所已无该方向仓位"
                       f"（止盈/止损触发），清理残留")
 
-                # 判定止损/止盈：拉该 symbol 最近成交，用 realizedPnl 判断盈亏
+                # 判定止损/止盈：拉该 symbol 的成交，按方向+时间窗口汇总 realizedPnl。
+                # 关键：一笔平仓可能分多笔撮合，每笔子成交各带一份 realizedPnl，
+                # 必须对「本笔持仓开仓之后、且同方向」的所有平仓成交求和，才是整笔真实盈亏。
                 realized = None
                 try:
-                    trades = rm.broker.get_user_trades(sym, limit=20)
-                    # 找到该方向最近一笔有 realizedPnl 的成交
+                    # 时间窗口起点 = 本笔开仓挂单时间（回退到信号 K线时间或一个较大窗口）
+                    open_ms = int(t.entry_order_time * 1000) if t.entry_order_time else 0
+                    # 拉最近 N 笔成交，反向（新→旧）累加同方向的 realizedPnl，
+                    # 直到越过开仓时间窗口（或达到足够数量）。
+                    trades = rm.broker.get_user_trades(sym, limit=50)
+                    total = 0.0
+                    found = False
                     for tr in reversed(trades):
-                        if abs(float(tr.get("realizedPnl", 0))) > 1e-9:
-                            realized = float(tr.get("realizedPnl", 0))
+                        tr_time = tr.get("time")
+                        tr_side = tr.get("positionSide", "BOTH")
+                        # 只累积「本笔方向」的成交（LONG/SHORT 精确匹配）
+                        if tr_side != t.direction:
+                            continue
+                        # 已越过本笔开仓时间窗口（成交从新到旧遍历），停止
+                        if open_ms and tr_time and int(tr_time) < open_ms:
                             break
+                        rp = float(tr.get("realizedPnl", 0) or 0)
+                        if abs(rp) > 1e-9:
+                            total += rp
+                            found = True
+                    if found:
+                        realized = total
                 except Exception:
                     realized = None
 

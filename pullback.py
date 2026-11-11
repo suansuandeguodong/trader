@@ -157,28 +157,29 @@ class PullbackManager:
                 # 触发：记录触碰那根 K线收盘时刻的 EMA20 值作为入场价
                 entry = ema
                 ps.entered = True
-                # 计算止盈止损（15m 维度）
-                stop, tp = self._compute_stop_tp(direction, ps)
+                # 计算止盈止损（止盈以入场价 entry 为基准）
+                stop, tp = self._compute_stop_tp(direction, ps, entry)
                 return {"entry": entry, "stop": stop, "tp": tp,
                         "touch_bar_time": b["t"]}
 
         return None
 
-    def _compute_stop_tp(self, direction: str, ps: PendingSignal) -> tuple:
+    def _compute_stop_tp(self, direction: str, ps: PendingSignal, entry: float) -> tuple:
         """
-        计算止盈/止损（15m 维度）。
+        计算止盈/止损。
 
-        止盈 = 信号K线 close + (close-open)/2（做多），做空对称。
+        止盈 = 入场价 ± 信号K线实体的一半（做多加、做空减）。
         止损 = min(信号K线 open, 信号K线前一根 open)（做多取更低），做空取 max。
         返回 (stop, tp)，未对齐。
         """
         o, c, prev = ps.sig_open, ps.sig_close, ps.prev_open
+        half_body = (c - o) / 2.0 if direction == "LONG" else (o - c) / 2.0
 
         if direction == "LONG":
-            tp = c + (c - o) / self.risk_reward
+            tp = entry + half_body
             stop = min(o, prev)
         else:  # SHORT
-            tp = c - (o - c) / self.risk_reward
+            tp = entry - half_body
             stop = max(o, prev)
         return stop, tp
 

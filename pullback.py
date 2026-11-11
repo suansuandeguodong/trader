@@ -114,8 +114,8 @@ class PullbackManager:
         if ps.entered:
             return None
 
-        # 观察期超时检查：从信号K线收盘起算
-        if now_ms - ps.sig_close_ms > self.watch_seconds * 1000:
+        # 观察期超时检查：从信号K线收盘起算（达到 watch_seconds 即超时）
+        if now_ms - ps.sig_close_ms >= self.watch_seconds * 1000:
             return {"__timeout__": True}
 
         # 拉最新 3m K线（含可能进行中的最后一根，push_close 内部会去重/丢弃未收盘）

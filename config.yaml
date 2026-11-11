@@ -6,7 +6,6 @@ testnet: false                         # false = 真实合约，true = 测试网
 
 # ============ 选币池 ============
 min_volume_usdt: 18000000              # 24h 成交额下限（USDT）
-max_price_usdt: 1.0                    # 价格上限（USDT），只保留 <= 该值的币
 
 # ============ 信号参数 ============
 ema_period: 20                         # EMA 周期

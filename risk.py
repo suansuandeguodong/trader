@@ -32,6 +32,7 @@ class Trade:
     stop_order_id: Optional[int] = None
     tp_order_id: Optional[int] = None
     state: str = "PENDING"  # PENDING / FILLED / CANCELLED / CLOSED
+    fixed_tp: bool = False  # 止盈价是否固定（3m回调策略），成交后不重算
     filled_qty: float = 0.0  # 已成交且已挂止损止盈保护的累计数量
     trade_id: Optional[str] = None  # 本地交易标识，用于落盘关联各事件
     signal_bar_time: Optional[int] = None  # 信号K线 openTime(ms)，观察期计时起点
@@ -113,15 +114,18 @@ class RiskManager:
         return self.open_position_count() < self.max_positions
 
     def register_trade(self, symbol: str, direction: str, entry: float,
-                       stop: float, tp: float, qty: float) -> Optional[Trade]:
+                       stop: float, tp: float, qty: float,
+                       fixed_tp: bool = False) -> Optional[Trade]:
         """
         注册一笔交易。若该 (symbol, 方向) 已存在持仓/挂单，则返回 None（不覆盖）。
+        fixed_tp: True 表示止盈价是固定值（3m回调策略），成交后不重算。
         """
         key = self._key(symbol, direction)
         if key in self.trades:
             return None
         t = Trade(symbol=symbol, direction=direction, entry_price=entry,
-                  stop_price=stop, take_profit_price=tp, qty=qty, state="PENDING")
+                  stop_price=stop, take_profit_price=tp, qty=qty, state="PENDING",
+                  fixed_tp=fixed_tp)
         self.trades[key] = t
         return t
 

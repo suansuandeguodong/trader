@@ -48,7 +48,6 @@ with open(BASE_DIR / "config.yaml", "r", encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 MIN_VOLUME_USDT = CFG.get("min_volume_usdt", 18_000_000)
-MAX_PRICE_USDT = CFG.get("max_price_usdt", 1.0)
 EMA_PERIOD = CFG.get("ema_period", 20)
 MIN_DOWN_BARS = CFG.get("min_down_bars", 8)
 MIN_UP_BARS = CFG.get("min_up_bars", 8)
@@ -94,7 +93,7 @@ def build_candidates() -> list:
         if volumes.get(s, 0) < MIN_VOLUME_USDT:
             continue
         price = prices.get(s, 0)
-        if price <= 0 or price > MAX_PRICE_USDT:
+        if price <= 0:
             continue
         result.append(s)
     return result
@@ -362,10 +361,14 @@ def _place_stop_tp(rm: RiskManager, t, qty=None, fill_price=None):
 
     # 基于成交价重算止盈价（止损价保持 = 信号 open 不变）
     stop = t.stop_price
-    if t.direction == "LONG":
-        tp = fill_price + (fill_price - stop) / 2.0
-    else:  # SHORT
-        tp = fill_price - (stop - fill_price) / 2.0
+    if t.fixed_tp:
+        # 固定止盈（3m回调策略）：止盈价已在开仓时定死，不随成交价重算
+        tp = t.take_profit_price
+    else:
+        if t.direction == "LONG":
+            tp = fill_price + (fill_price - stop) / 2.0
+        else:  # SHORT
+            tp = fill_price - (stop - fill_price) / 2.0
 
     # 对齐精度
     stop = rm.broker.round_price(t.symbol, stop)
@@ -528,8 +531,9 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
     """按信号开仓。meta 为信号元数据（用于详细落盘）。
 
     entry/stop/tp 为可选：不传则用 15m 信号价计算（compute_prices），
-    传了（3m 回调入场场景）则直接用传入的三价。
+    传了（3m 回调入场场景）则直接用传入的三价，且止盈价固定（成交后不重算）。
     """
+    fixed_tp = (entry is not None and stop is not None and tp is not None)
     if entry is None or stop is None or tp is None:
         entry, stop, tp = rm.compute_prices(direction, o, c)
     qty = rm.compute_qty(sym, entry)
@@ -587,7 +591,7 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
     side = rm.side_for_entry(direction)
     pos_side = rm.position_side(direction)
     # 注册交易状态（先注册，再挂单）
-    t = rm.register_trade(sym, direction, entry, stop, tp, qty)
+    t = rm.register_trade(sym, direction, entry, stop, tp, qty, fixed_tp=fixed_tp)
     if t is None:
         print(f"  [跳过] {sym} {direction} 已在持仓/挂单中，拒绝重复开仓")
         return
@@ -626,7 +630,7 @@ def main():
 
     print("=" * 72)
     print("  EMA20 拐头反转 · 量化实盘交易（多空双向）")
-    print(f"  币池: 24h成交额>{MIN_VOLUME_USDT/1e6:.0f}M, 价格<={MAX_PRICE_USDT}")
+    print(f"  币池: 24h成交额>{MIN_VOLUME_USDT/1e6:.0f}M")
     print(f"  仓位: 每笔 {NOTIONAL_USDT}U | 盈亏比 {RISK_REWARD}:1 | 最大持仓 {MAX_POSITIONS}")
     print(f"  杠杆: {LEVERAGE}x | 撤单超时 {CANCEL_TIMEOUT_SEC//60} 分钟")
     print("=" * 72)

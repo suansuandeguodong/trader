@@ -121,10 +121,14 @@ class PullbackManager:
         if now_ms - ps.sig_close_ms >= self.watch_seconds * 1000:
             return {"__timeout__": True}
 
-        # 拉最新 3m K线（含可能进行中的最后一根，push_close 内部会去重/丢弃未收盘）
+        # 拉最新 3m K线。拉取足够多的根数（窗口长度），确保能够：
+        #  1) 重建信号收盘前已存在的 3m EMA20 基线；
+        #  2) 逐根推进「信号收盘后」的已收盘 3m K线做触碰判定。
+        # 若只拉 3 根，会因 push_close 的去重而跳过 K线，导致 EMA 滞后/错乱
+        # （实盘中 ONE 入场价 0.00171389 vs 正确 0.0015698，即由此造成）。
         try:
             from market import get_3m_klines
-            bars = get_3m_klines(symbol, limit=3)
+            bars = get_3m_klines(symbol, limit=self.window_size)
         except Exception as e:
             print(f"  [3m拉取] {symbol} 失败: {e}")
             return None
@@ -141,29 +145,37 @@ class PullbackManager:
             if not is_closed:
                 continue  # 进行中的 K线：本轮跳过，等它收盘
 
-            ema = self.sema_3m.push_close(symbol, b["t"], b["c"])
-            if ema is None:
-                continue
             # 只对「信号K线收盘之后」的已收盘 3m K线做触碰判定
             if b["t"] < ps.sig_close_ms:
-                continue  # 早于信号K线收盘，不算
+                # 早于信号K线收盘的 K线仍需推进 EMA（保持基线正确），但不判定触碰
+                self.sema_3m.push_close(symbol, b["t"], b["c"])
+                continue
+
+            # 触碰判定用「推进前的 EMA20」作为参照均线，避免用「触碰K线自身的收盘价」
+            # 推进后的 EMA 做判定（那会把入场价拉偏，见 ONE/AKE 的异常高价）。
+            ema_before = self.sema_3m.get_ema(symbol)
+            # 用本根收盘价推进 EMA（供后续 K线继续使用）
+            ema_after = self.sema_3m.push_close(symbol, b["t"], b["c"])
+            if ema_before is None:
+                continue
 
             low = b["l"]
             high = b["h"]
 
             if direction == "LONG":
-                touched = low <= ema
+                touched = low <= ema_before
             else:  # SHORT
-                touched = high >= ema
+                touched = high >= ema_before
 
             if touched:
-                # 触发：记录触碰那根 K线收盘时刻的 EMA20 值作为入场价
-                entry = ema
+                # 触发：入场价 = 触碰那根 3m K线【收盘后】算出的 EMA20
+                # （含触碰 K线自身的收盘价，符合策略注释第 13 行语义）
+                entry = ema_after
                 ps.entered = True
                 # 计算止盈止损（止盈以入场价 entry 为基准）
-                stop, tp = self._compute_stop_tp(direction, ps, entry)
+                stop, tp, half_body = self._compute_stop_tp(direction, ps, entry)
                 return {"entry": entry, "stop": stop, "tp": tp,
-                        "touch_bar_time": b["t"]}
+                        "half_body": half_body, "touch_bar_time": b["t"]}
 
         return None
 
@@ -174,7 +186,7 @@ class PullbackManager:
         止盈 = 入场价 ± 信号K线实体的一半（做多加、做空减）。
         止损 = min(信号K线最低价, 前一根开盘价)（做多取更低），
                max(信号K线最高价, 前一根开盘价)（做空取更高）。
-        返回 (stop, tp)，未对齐。
+        返回 (stop, tp, half_body)，未对齐。half_body 用于成交后用真实成交价重算止盈。
         """
         o, c, prev = ps.sig_open, ps.sig_close, ps.prev_open
         half_body = (c - o) / 2.0 if direction == "LONG" else (o - c) / 2.0
@@ -185,7 +197,7 @@ class PullbackManager:
         else:  # SHORT
             tp = entry - half_body
             stop = max(ps.sig_high, prev)
-        return stop, tp
+        return stop, tp, half_body
 
     # ── 生命周期 ──
 

@@ -81,6 +81,15 @@ class PullbackManager:
 
     def remove(self, symbol: str, direction: str):
         self.pending.pop(self._key(symbol, direction), None)
+        # 若该 symbol 已无任何方向在观察，则清掉其残留的 3m 窗口状态，
+        # 避免下一笔同 symbol 信号沿用旧的 EMA（ready() 幂等会跳过重 init），
+        # 导致触碰判定的均线基准错误（如 ZEC 做空沿用了更早 LONG 的遗留 EMA）。
+        if not self._has_pending(symbol):
+            self.sema_3m.reset(symbol)
+
+    def _has_pending(self, symbol: str) -> bool:
+        """该 symbol 是否仍有任意方向在观察中。"""
+        return any(sym == symbol for (sym, _d) in self.pending)
 
     # ── 3m 窗口预热 ──
 

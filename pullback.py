@@ -2,19 +2,19 @@
 3m 回调入场模块（Pullback Entry）
 
 策略：15m K线拐头出信号后，不立即开仓，而是切换到 3m 级别，
-     等待价格回调到 3m 的 EMA20（触碰/穿越），再以当时 EMA20 值挂限价单入场。
+     等待价格回调到 3m 的 EMA（触碰/穿越），再以当时 EMA 值挂限价单入场。
 
 核心概念：
   - 观察期：15m 信号K线收盘后 N 秒（默认 1800s = 30min）内，
-    若 3m 价格没回调到 3m EMA20，则放弃该信号，不追高/追低。
+    若 3m 价格没回调到 3m EMA，则放弃该信号，不追高/追低。
   - 触碰判定（3m K线收盘后确认）：
-      做多：3m K线 lowest <= 3m EMA20（价格跌下来碰到了均线）
-      做空：3m K线 highest >= 3m EMA20（价格涨上去碰到了均线）
-  - 入场价 = 触碰那根 3m K线收盘时刻算出的 3m EMA20 值（固定，不再变）。
+      做多：3m K线 lowest <= 3m EMA（价格跌下来碰到了均线）
+      做空：3m K线 highest >= 3m EMA（价格涨上去碰到了均线）
+  - 入场价 = 触碰那根 3m K线收盘时刻算出的 3m EMA 值（固定，不再变）。
 
 依赖：
   - market.get_3m_klines 拉取 3m K线
-  - sliding.SlidingEMA  复用滑动窗口做 3m EMA20 计算
+  - sliding.SlidingEMA  复用滑动窗口做 3m EMA 计算
 
 本模块不直接下单，只负责「判定是否该入场 + 计算出 entry/stop/tp」，
 下单动作由 trader.py 调用回调完成，保持职责单一。
@@ -41,9 +41,9 @@ class PendingSignal:
 
 
 class PullbackManager:
-    """管理所有「观察中」的 15m 信号，维护独立的 3m EMA20 窗口并执行触碰判定。"""
+    """管理所有「观察中」的 15m 信号，维护独立的 3m EMA 窗口并执行触碰判定。"""
 
-    def __init__(self, ema_period: int = 20, window_size: int = 300,
+    def __init__(self, ema_period: int = 15, window_size: int = 300,
                  warmup_limit: int = 300, watch_seconds: int = 1800,
                  risk_reward: float = 2.0):
         self.ema_period = ema_period
@@ -177,7 +177,7 @@ class PullbackManager:
                 touched = high >= ema_before
 
             if touched:
-                # 入场价 = 触碰那根 3m K线【收盘后】算出的 EMA20（含触碰 K线自身收盘价）。
+                # 入场价 = 触碰那根 3m K线【收盘后】算出的 EMA（含触碰 K线自身收盘价）。
                 ema_after = baseline.push_close(symbol, b["t"], b["c"])
                 entry = ema_after if ema_after is not None else ema_before
                 ps.entered = True

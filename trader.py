@@ -484,9 +484,9 @@ def _notify(markdown: str):
 def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                           check_every: int = 15):
     """
-    3m 回调监控线程：周期性检查「观察中」的 15m 信号，判定是否回调触碰 3m EMA20。
+    3m 回调监控线程：周期性检查「观察中」的 15m 信号，判定是否回调触碰 3m EMA。
 
-    触发后调用 open_trade 以 3m EMA20 值挂限价单入场；
+    触发后调用 open_trade 以 3m EMA 值挂限价单入场；
     观察期超时则放弃该信号。
     """
     global _running
@@ -508,11 +508,11 @@ def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                         f"**⌛ 放弃信号 · {sym}**\n"
                         f"\n"
                         f"方向: {'做多 LONG' if direction == 'LONG' else '做空 SHORT'}\n"
-                        f"15m拐头后 {PULLBACK_WATCH_SECONDS // 60} 分钟内未回调到 3m EMA20，放弃。"
+                        f"15m拐头后 {PULLBACK_WATCH_SECONDS // 60} 分钟内未回调到 3m EMA，放弃。"
                     )
                     continue
 
-                # 触发：用 3m EMA20 作为入场价，开仓
+                # 触发：用 3m EMA 作为入场价，开仓
                 entry = result["entry"]
                 stop = result["stop"]
                 tp = result["tp"]
@@ -541,14 +541,14 @@ def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                             f"**🎯 回踩到位 · {sym}**\n"
                             f"\n"
                             f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
-                            f"3m 已触碰 EMA20，入场价 {entry:.6g}。"
+                            f"3m 已触碰 EMA，入场价 {entry:.6g}。"
                         )
                         meta = {
                             "bar_time": ps.sig_close_ms - BAR_INTERVAL_MS,
                             "open": ps.sig_open,
                             "close": ps.sig_close,
                             "prev_open": ps.prev_open,
-                            "entry_source": "3m_ema20",
+                            "entry_source": "3m_ema",
                         }
                         open_trade(rm, sym, direction, ps.sig_open, ps.sig_close,
                                    meta, entry=entry, stop=stop, tp=tp,
@@ -716,7 +716,7 @@ def main():
     rev_up = EMA20Reversal(min_down_bars=MIN_DOWN_BARS)
     rev_down = EMA20ReversalDown(min_up_bars=MIN_UP_BARS)
 
-    # 3m 回调入场管理器（观察中状态 + 3m EMA20 触碰判定）
+    # 3m 回调入场管理器（观察中状态 + 3m EMA 触碰判定）
     pullback_mgr = PullbackManager(
         ema_period=PULLBACK_EMA_PERIOD,
         window_size=PULLBACK_WINDOW,
@@ -871,7 +871,7 @@ def main():
                             print(f"  [影线·新流程] {sym} {direction} 30m影线满足，直接挂单")
                             open_trade(rm, sym, direction, o, c, meta)
                         elif ENABLE_PULLBACK and pullback_mgr is not None:
-                            # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA20 再开仓
+                            # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA 再开仓
                             prev_open = meta.get("prev_open") if meta else None
                             sig_low = meta.get("low") if meta else None
                             sig_high = meta.get("high") if meta else None
@@ -880,12 +880,12 @@ def main():
                                 sym, direction, o, c, sig_low, sig_high,
                                 prev_open, sig_close_ms)
                             if ok:
-                                print(f"  [观察] {sym} {direction} 15m拐头，等待3m回调到EMA20")
+                                print(f"  [观察] {sym} {direction} 15m拐头，等待3m回调到EMA")
                                 _notify(
                                     f"**👀 等待回踩入场 · {sym}**\n"
                                     f"\n"
                                     f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
-                                    f"15m已拐头，等待价格回调到 3m EMA20 再挂单。"
+                                    f"15m已拐头，等待价格回调到 3m EMA 再挂单。"
                                 )
                             else:
                                 print(f"  [跳过] {sym} {direction} 已在观察中，忽略重复")

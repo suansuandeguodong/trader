@@ -31,8 +31,8 @@ cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（
 leverage: 10                           # 杠杆倍数（10x）
 
 # ============ 3m 回调入场 ============
-enable_pullback: true                  # 开关：15m拐头后等3m回调到EMA20再入场（false则退回原"信号即挂单"）
-pullback_ema_period: 20                # 3m 的 EMA 周期
+enable_pullback: true                  # 开关：15m拐头后等3m回调到EMA15再入场（false则退回原"信号即挂单"）
+pullback_ema_period: 15                # 3m 的 EMA 周期
 pullback_warmup: 300                   # 3m 预热拉取历史 K 线数
 pullback_window: 300                   # 3m 滑动窗口长度
 pullback_watch_seconds: 1800           # 观察期时长（秒）= 30 分钟，超时未回调则放弃信号

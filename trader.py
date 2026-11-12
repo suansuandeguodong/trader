@@ -246,17 +246,80 @@ def _handle_one_close(rm: RiskManager, t, sym: str, pos_side: str):
         + (f"\n持仓时长: {hold_sec/60:.1f} 分钟" if hold_sec else "")
     )
 
-    # 撤销残留单：
-    #   止损单是 Algo 条件单 -> cancel_algo_order
-    #   止盈单是普通限价单 -> cancel_order
-    # 两单一剩另一，需全部撤掉。
+    # 选项A：彻底结清这一笔（精准撤销开仓单 → 确认撤干净 → 强校验持仓归零 → 才移除）
+    _close_and_cleanup(rm, t, sym, pos_side)
+
+
+def _close_and_cleanup(rm: RiskManager, t, sym: str, pos_side: str):
+    """
+    选项A：止损/止盈触发后，彻底结清这一笔，杜绝「剩余开仓单复活成裸仓」。
+
+    相较于旧逻辑的「撤一下就走」，这里执行「精准撤销 → 确认撤干净 → 强校验持仓归零」：
+
+      1) 精准撤销本笔开仓单（entry_order_id），不误伤同 symbol 另一方向。
+      2) 撤销止损单（algoOrder）与止盈限价单。
+      3) 轮询确认开仓单已 CANCELED/EXPIRED；若撤单过程中又有新成交
+         （executedQty > t.filled_qty），立即市价平掉这部分增量，避免裸仓。
+      4) 再次强校验该 (symbol, direction) 的交易所持仓已归零；若不归零，市价补平。
+      5) 全部确认干净后才移除本地记录。
+
+    任何一步异常都不隐藏，打印告警并保守保留本地记录，交由下一轮重试（而不盲目移除）。
+    """
+    stop_side = rm.side_for_exit(t.direction)
+
+    # 1) 精准撤销本笔开仓限价单（而非 cancel_all_open_orders，避免误伤另一方向）
+    if t.entry_order_id:
+        rm.broker.cancel_order(sym, t.entry_order_id)
+
+    # 2) 撤止损单（Algo）与止盈限价单
     if t.stop_order_id:
         rm.broker.cancel_algo_order(sym, t.stop_order_id)
     if t.tp_order_id:
         rm.broker.cancel_order(sym, t.tp_order_id)
 
-    # 兜底：撤销该 symbol 的所有普通挂单（防遗漏）
-    rm.broker.cancel_all_open_orders(sym)
+    # 3) 轮询确认开仓单确已撤销，并检测撤单期间是否又成交
+    if t.entry_order_id:
+        # 撤单生效有延迟，轮询最多 ~3 秒，确认状态终态
+        for _ in range(6):
+            o = rm.broker.query_order(sym, t.entry_order_id)
+            if not o:
+                break  # 查询失败，交给下一轮重试
+            status = o.get("status")
+            if status in ("CANCELED", "EXPIRED", "FILLED"):
+                # 终态：检查撤单期间是否有新增成交（executedQty 越过已保护量）
+                cum_qty = float(o.get("executedQty", 0))
+                extra = cum_qty - t.filled_qty
+                if extra > 1e-12:
+                    # 撤单过程中又成交了 extra，立即市价平掉，避免裸仓
+                    try:
+                        extra = rm.broker.round_qty(sym, extra)
+                    except Exception:
+                        pass
+                    if extra > 0:
+                        rm.broker.place_market_order(sym, stop_side, extra,
+                                                     position_side=pos_side)
+                        print(f"  [结清] {sym} {t.direction} 撤单期间又成交 "
+                              f"{extra}，已市价补平")
+                break
+            # 尚未到终态，稍等再查
+            time.sleep(0.5)
+
+    # 4) 强校验该方向持仓归零；不归零则市价补平残余
+    try:
+        positions = rm.broker.get_open_positions()
+        residual = 0.0
+        for p in positions:
+            if p.get("symbol") == sym and p.get("positionSide", "BOTH") == t.direction:
+                residual += float(p.get("positionAmt", 0))
+        if abs(residual) > 1e-12:
+            qty = abs(residual)
+            rm.broker.place_market_order(sym, stop_side, qty,
+                                         position_side=pos_side)
+            print(f"  [结清] {sym} {t.direction} 仍有残仓 {residual}，已市价补平")
+    except Exception as e:
+        print(f"  [结清] {sym} 强校验持仓失败: {e}")
+
+    # 5) 确认干净后移除本地记录
     rm.remove_trade(sym, t.direction)
 
 

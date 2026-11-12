@@ -37,6 +37,7 @@ from reversal_down import EMA20ReversalDown
 from broker import BinanceFutures
 from risk import RiskManager
 from pullback import PullbackManager
+from shadow_filter import is_shadow_signal
 from wecom_notifier import WeComNotifier
 import trade_log as tlog
 
@@ -858,7 +859,18 @@ def main():
                         print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
                         continue
                     try:
-                        if ENABLE_PULLBACK and pullback_mgr is not None:
+                        # 新增逻辑分支：30m 影线条件
+                        signal_open_ms = meta.get("bar_time") if meta else None
+                        shadow_met = (
+                            signal_open_ms is not None
+                            and is_shadow_signal(sym, direction, signal_open_ms)
+                        )
+                        if shadow_met:
+                            # 影线条件满足 → 新流程：信号收盘价挂限价单，
+                            # 开盘价止损，盈亏比 1(盈):2(亏)（compute_prices 已实现）。
+                            print(f"  [影线·新流程] {sym} {direction} 30m影线满足，直接挂单")
+                            open_trade(rm, sym, direction, o, c, meta)
+                        elif ENABLE_PULLBACK and pullback_mgr is not None:
                             # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA20 再开仓
                             prev_open = meta.get("prev_open") if meta else None
                             sig_low = meta.get("low") if meta else None

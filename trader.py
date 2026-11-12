@@ -62,11 +62,11 @@ BATCH_INTERVAL = CFG.get("batch_interval", 1.5)
 RESCAN_INTERVAL = CFG.get("rescan_interval", 14400)
 LEAD_SECONDS = CFG.get("lead_seconds", 15)
 
-NOTIONAL_USDT = CFG.get("order_notional_usdt", 108.0)
+NOTIONAL_USDT = CFG.get("order_notional_usdt", 200.0)
 RISK_REWARD = CFG.get("risk_reward_ratio", 2.0)
 MAX_POSITIONS = CFG.get("max_positions", 15)
 CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
-LEVERAGE = CFG.get("leverage", 10)
+LEVERAGE = CFG.get("leverage", 20)
 
 # 3m 回调入场
 ENABLE_PULLBACK = CFG.get("enable_pullback", True)

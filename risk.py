@@ -41,7 +41,7 @@ class Trade:
 class RiskManager:
     """负责出入场规则计算与仓位状态管理。"""
 
-    def __init__(self, broker: BinanceFutures, notional_usdt: float = 108.0,
+    def __init__(self, broker: BinanceFutures, notional_usdt: float = 200.0,
                  risk_reward: float = 2.0, max_positions: int = 30,
                  cancel_timeout_sec: int = 900):
         self.broker = broker

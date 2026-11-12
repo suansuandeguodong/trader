@@ -50,8 +50,8 @@ with open(BASE_DIR / "config.yaml", "r", encoding="utf-8") as f:
 
 MIN_VOLUME_USDT = CFG.get("min_volume_usdt", 18_000_000)
 EMA_PERIOD = CFG.get("ema_period", 20)
-MIN_DOWN_BARS = CFG.get("min_down_bars", 8)
-MIN_UP_BARS = CFG.get("min_up_bars", 8)
+MIN_DOWN_BARS = CFG.get("min_down_bars", 13)
+MIN_UP_BARS = CFG.get("min_up_bars", 13)
 MIN_BODY_PCT = CFG.get("min_body_pct", 1.0)
 MAX_BODY_PCT = CFG.get("max_body_pct", 3.0)
 WINDOW_SIZE = CFG.get("window_size", 300)

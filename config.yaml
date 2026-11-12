@@ -9,8 +9,8 @@ min_volume_usdt: 18000000              # 24h 成交额下限（USDT）
 
 # ============ 信号参数 ============
 ema_period: 20                         # EMA 周期
-min_down_bars: 8                       # 向上拐头前需连续不涨最少根数
-min_up_bars: 8                         # 向下拐头前需连续不跌最少根数
+min_down_bars: 13                      # 向上拐头前需连续不涨最少根数
+min_up_bars: 13                        # 向下拐头前需连续不跌最少根数
 min_body_pct: 1.0                      # 拐头 K 线实体涨/跌幅下限（%）
 max_body_pct: 3.0                     # 拐头 K 线实体涨/跌幅上限（%），超过则不交易（止损幅度过大）
 

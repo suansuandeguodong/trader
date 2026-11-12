@@ -4,7 +4,7 @@ EMA20 低位拐头向上信号模块（15m K线）
 规则：
   - EMA20 基于 15m K线收盘价计算
   - 拐头向上：某根 K 线收盘后，其 EMA20 > 前一根的 EMA20
-  - 前置条件：该拐头 K 线之前，连续「至少 MIN_DOWN_BARS（默认 8）根」
+  - 前置条件：该拐头 K 线之前，连续「至少 MIN_DOWN_BARS（默认 13）根」
     EMA20 都是不涨的（后一根 <= 前一根），即这段内没有任何一根上涨
   - 不需要价格配合（不看收盘价 vs EMA20、不看阴阳线）
 
@@ -61,7 +61,7 @@ class EMA20Reversal:
       只要指数还在跌/平，计数累加；一旦上涨就触发判定，然后清零重新计数。
     """
 
-    def __init__(self, min_down_bars: int = 8):
+    def __init__(self, min_down_bars: int = 13):
         self.min_down_bars = min_down_bars
         # {symbol: {"down_count": int, "prev_ema": float, "ema_history": [float, ...]}}
         self._state: dict = {}

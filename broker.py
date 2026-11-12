@@ -267,15 +267,19 @@ class BinanceFutures:
         return None
 
     def place_market_order(self, symbol: str, side: str, qty: float,
-                           position_side: str = "BOTH",
-                           reduce_only: bool = True) -> Optional[dict]:
-        """市价单（主要用于平仓）。传入的 qty 应已对齐。默认 reduceOnly 防止误开反向仓。"""
+                           position_side: str = "BOTH") -> Optional[dict]:
+        """
+        市价单（主要用于平仓）。传入的 qty 应已对齐。
+
+        注意：本账户为「双向持仓模式」，下单必传 positionSide(LONG/SHORT) 精确指向
+        要平的仓位方向，此时币安禁止再传 reduceOnly（会报 -1106 "reduceonly sent
+        when not required"），故这里不传 reduceOnly，靠 positionSide 兜底方向。
+        """
         params = {
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
             "quantity": self._fmt(qty),
-            "reduceOnly": "true" if reduce_only else "false",
         }
         if position_side != "BOTH":
             params["positionSide"] = position_side
@@ -288,7 +292,7 @@ class BinanceFutures:
         return None
 
     def place_stop_market(self, symbol: str, side: str, qty: float,
-                          stop_price: float, reduce_only: bool = True,
+                          stop_price: float,
                           position_side: str = "BOTH") -> Optional[dict]:
         """
         止损市价单（STOP_MARKET），走 Algo 条件单端点。
@@ -296,6 +300,9 @@ class BinanceFutures:
         注意：该账户开启了「多资产保证金模式」，普通 /fapi/v1/order 接口
         对条件单返回 -4120，必须走 /fapi/v1/algoOrder + algoType=CONDITIONAL。
         触发价字段是 triggerPrice（不是 stopPrice）。
+
+        双向持仓模式下靠 positionSide 精确定位平仓方向，不传 reduceOnly
+        （与 /fapi/v1/order 同一规则，避免 -1106）。
         """
         params = {
             "algoType": "CONDITIONAL",
@@ -317,11 +324,11 @@ class BinanceFutures:
         return None
 
     def place_take_profit_market(self, symbol: str, side: str, qty: float,
-                                 stop_price: float, reduce_only: bool = True,
+                                 stop_price: float,
                                  position_side: str = "BOTH") -> Optional[dict]:
         """
         止盈市价单（TAKE_PROFIT_MARKET），走 Algo 条件单端点。
-        触发价字段是 triggerPrice。
+        触发价字段是 triggerPrice。双向持仓模式下靠 positionSide 定位方向。
         """
         params = {
             "algoType": "CONDITIONAL",

@@ -397,7 +397,7 @@ def _place_stop_tp(rm: RiskManager, t, qty=None, fill_price=None):
         print(f"  [止损越界] {t.symbol} {t.direction} 成交价 {fill_price:.6g} "
               f"已越过止损价 {stop:.6g}，立即市价平仓止损")
         close_r = rm.broker.place_market_order(
-            t.symbol, stop_side, qty, position_side=pos_side, reduce_only=True)
+            t.symbol, stop_side, qty, position_side=pos_side)
         if close_r:
             tlog.log_close(t.symbol, t.direction, getattr(t, "trade_id", ""),
                            "止损价越界·市价平仓",
@@ -422,7 +422,7 @@ def _place_stop_tp(rm: RiskManager, t, qty=None, fill_price=None):
     ok = True
     # 挂止损单（条件单，Algo 端点，STOP_MARKET）
     stop_r = rm.broker.place_stop_market(
-        t.symbol, stop_side, qty, stop, reduce_only=True,
+        t.symbol, stop_side, qty, stop,
         position_side=pos_side)
     if stop_r:
         t.stop_order_id = stop_r.get("orderId")

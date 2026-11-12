@@ -267,13 +267,15 @@ class BinanceFutures:
         return None
 
     def place_market_order(self, symbol: str, side: str, qty: float,
-                           position_side: str = "BOTH") -> Optional[dict]:
-        """市价单（主要用于平仓）。传入的 qty 应已对齐。"""
+                           position_side: str = "BOTH",
+                           reduce_only: bool = True) -> Optional[dict]:
+        """市价单（主要用于平仓）。传入的 qty 应已对齐。默认 reduceOnly 防止误开反向仓。"""
         params = {
             "symbol": symbol,
             "side": side,
             "type": "MARKET",
             "quantity": self._fmt(qty),
+            "reduceOnly": "true" if reduce_only else "false",
         }
         if position_side != "BOTH":
             params["positionSide"] = position_side

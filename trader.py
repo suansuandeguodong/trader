@@ -383,6 +383,41 @@ def _place_stop_tp(rm: RiskManager, t, qty=None, fill_price=None):
     t.stop_price = stop
     t.take_profit_price = tp
 
+    # 关键防御：成交价已越过预定止损价时，止损单（STOP_MARKET）会因触发价方向
+    # 违反交易所规则而被拒（做多要求 triggerPrice < 当前价，做空反之）。
+    # 此时应立即市价平仓止损，避免裸仓暴露，而不是干等下一轮。
+    crossed = False
+    if t.direction == "LONG" and fill_price <= stop:
+        crossed = True
+    elif t.direction == "SHORT" and fill_price >= stop:
+        crossed = True
+
+    if crossed:
+        print(f"  [止损越界] {t.symbol} {t.direction} 成交价 {fill_price:.6g} "
+              f"已越过止损价 {stop:.6g}，立即市价平仓止损")
+        close_r = rm.broker.place_market_order(
+            t.symbol, stop_side, qty, position_side=pos_side, reduce_only=True)
+        if close_r:
+            tlog.log_close(t.symbol, t.direction, getattr(t, "trade_id", ""),
+                           "止损价越界·市价平仓",
+                           price=fill_price, pnl=None,
+                           close_time_ms=int(time.time() * 1000))
+            _notify(
+                f"**⚠️ 止损越界平仓 · {t.symbol}**\n"
+                f"\n"
+                f"方向: {'做多 LONG' if t.direction == 'LONG' else '做空 SHORT'}\n"
+                f"成交价 {fill_price:.6g} 已越过止损价 {stop:.6g}，已市价平仓止损。"
+            )
+        else:
+            print(f"  [止损越界] {t.symbol} 市价平仓也失败，陷入裸仓，人工介入！")
+            _notify(
+                f"**🚨 急·市价平仓失败 · {t.symbol}**\n"
+                f"\n"
+                f"成交价 {fill_price:.6g} 已越过止损价 {stop:.6g}，"
+                f"且市价平仓失败，请立即人工处理。"
+            )
+        return
+
     ok = True
     # 挂止损单（条件单，Algo 端点，STOP_MARKET）
     stop_r = rm.broker.place_stop_market(

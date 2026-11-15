@@ -7,9 +7,9 @@
   - 止盈价 = 入场价 ± 止损幅度的一半（盈亏比 2:1，亏2赚1）
     做多：止盈 = close + (close - open) × 0.5
     做空：止盈 = close - (open - close) × 0.5
-  - 每笔命名价值 15 USDT，数量 = 15 / 价格，向下取整对齐 stepSize
+  - 每笔名义价值（order_notional_usdt USDT），数量 = 名义价值 / 价格，向下取整对齐 stepSize
   - 15 分钟（从挂单成功算起）未成交则撤单
-  - 最大同时持仓 30 个，持仓期间重复信号跳过
+  - 最大同时持仓 max_positions 个，持仓期间重复信号跳过
 """
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List
@@ -41,8 +41,8 @@ class Trade:
 class RiskManager:
     """负责出入场规则计算与仓位状态管理。"""
 
-    def __init__(self, broker: BinanceFutures, notional_usdt: float = 200.0,
-                 risk_reward: float = 2.0, max_positions: int = 30,
+    def __init__(self, broker: BinanceFutures, notional_usdt: float = 30.0,
+                 risk_reward: float = 2.0, max_positions: int = 7,
                  cancel_timeout_sec: int = 900):
         self.broker = broker
         self.notional_usdt = notional_usdt
@@ -73,7 +73,7 @@ class RiskManager:
         return entry, stop, tp
 
     def compute_qty(self, symbol: str, price: float) -> float:
-        """数量 = 15 USDT / 价格，向下取整对齐 stepSize。"""
+        """数量 = notional_usdt / 价格，向下取整对齐 stepSize。"""
         qty = self.notional_usdt / price
         qty = self.broker.round_qty(symbol, qty)
         return qty

@@ -24,11 +24,13 @@ rescan_interval: 14400                 # 候选池刷新间隔（秒）
 lead_seconds: 15                       # 15m K 线收盘前提前触发秒数
 
 # ============ 交易规则 ============
-order_notional_usdt: 200.0             # 每笔名义仓位（USDT）
+order_notional_usdt: 30.0              # 每笔名义仓位（USDT）
 risk_reward_ratio: 2.0                 # 盈亏比（止损:止盈 = 2:1，即亏2赚1）
-max_positions: 15                      # 最大同时持仓数
+max_positions: 7                       # 最大同时持仓数
 cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（秒）= 15 分钟
-leverage: 20                           # 杠杆倍数（20x）
+leverage: 50                           # 杠杆倍数（50x）
+no_trade_hour_start: 7                 # 禁开仓时段起点（本机时间小时），7:00 起禁
+no_trade_hour_end: 9                   # 禁开仓时段终点（本机时间小时），9:00 恢复（[start:00, end:00) 左闭右开）
 
 # ============ 3m 回调入场 ============
 enable_pullback: true                  # 开关：15m拐头后等3m回调到EMA15再入场（false则退回原"信号即挂单"）

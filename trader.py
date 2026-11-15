@@ -16,6 +16,7 @@ import signal
 import time
 import math
 import threading
+from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -62,11 +63,15 @@ BATCH_INTERVAL = CFG.get("batch_interval", 1.5)
 RESCAN_INTERVAL = CFG.get("rescan_interval", 14400)
 LEAD_SECONDS = CFG.get("lead_seconds", 15)
 
-NOTIONAL_USDT = CFG.get("order_notional_usdt", 200.0)
+NOTIONAL_USDT = CFG.get("order_notional_usdt", 30.0)
 RISK_REWARD = CFG.get("risk_reward_ratio", 2.0)
-MAX_POSITIONS = CFG.get("max_positions", 15)
+MAX_POSITIONS = CFG.get("max_positions", 7)
 CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
-LEVERAGE = CFG.get("leverage", 20)
+LEVERAGE = CFG.get("leverage", 50)
+
+# 禁开仓时段（本机时间，小时）
+NO_TRADE_HOUR_START = CFG.get("no_trade_hour_start", 7)
+NO_TRADE_HOUR_END = CFG.get("no_trade_hour_end", 9)
 
 # 3m 回调入场
 ENABLE_PULLBACK = CFG.get("enable_pullback", True)
@@ -544,6 +549,24 @@ def _notify(markdown: str):
         _notifier.send_markdown(markdown)
 
 
+def is_no_trade_time(now=None) -> bool:
+    """
+    判断当前是否处于禁开仓时段（本机时间）。
+
+    规则：NO_TRADE_HOUR_START:00:00 <= now < NO_TRADE_HOUR_END:00:00 时禁开。
+    即「7 点到 9 点」= 从 7:00:00 起到 9:00:00 前（不含 9:00 整点那一刻，9:00 恢复）。
+    now 可选，仅用于测试注入；不传则取本机当前本地时间。
+
+    用「到秒」的边界（而非小时字段），避免把「9点整」误扩成「整个 9 点小时」。
+    """
+    if now is None:
+        now = datetime.now().astimezone()  # 本机本地时区时间
+    minutes_of_day = now.hour * 60 + now.minute
+    start = NO_TRADE_HOUR_START * 60
+    end = NO_TRADE_HOUR_END * 60
+    return start <= minutes_of_day < end
+
+
 def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                           check_every: int = 15):
     """
@@ -637,6 +660,10 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
     传了（3m 回调入场场景）则直接用传入的三价。
     half_body: 信号K线实体的一半（3m策略），非 None 时成交后用真实成交价重算止盈。
     """
+    # 兜底守卫：二次确认不在禁开仓时段（防御任何绕过主循环拦截的开仓路径）
+    if is_no_trade_time():
+        print(f"  [非开仓时段] {sym} {direction} 处于禁开仓时段，放弃开仓")
+        return
     if entry is None or stop is None or tp is None:
         entry, stop, tp = rm.compute_prices(direction, o, c)
     qty = rm.compute_qty(sym, entry)
@@ -915,6 +942,10 @@ def main():
             print(f"[{_ts()}] 本轮共 {len(signals)} 个信号，处理开仓...")
             with _rm_lock:
                 for sym, direction, o, c, meta in signals:
+                    if is_no_trade_time():
+                        print(f"  [非开仓时段] {sym} {direction} 当前处于禁开仓时段 "
+                              f"({NO_TRADE_HOUR_START}:00-{NO_TRADE_HOUR_END}:00)，丢弃信号")
+                        continue
                     if rm.has_position_or_order(sym, direction):
                         print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
                         continue

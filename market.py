@@ -113,8 +113,3 @@ def get_15m_klines(symbol: str, limit: int = 500) -> list:
 def get_3m_klines(symbol: str, limit: int = 500) -> list:
     """获取 3m K线。"""
     return get_klines(symbol, "3m", limit)
-
-
-def get_30m_klines(symbol: str, limit: int = 500) -> list:
-    """获取 30m K线。"""
-    return get_klines(symbol, "30m", limit)

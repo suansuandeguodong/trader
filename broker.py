@@ -96,11 +96,22 @@ class BinanceFutures:
                     return {}
                 if resp.status_code == 200:
                     return resp.json()
-                # -2011 Unknown order：订单已不存在（已成交/已撤/已触发），
-                # 属确定性结果，重试无意义，直接返回标记让上层识别，避免空等 5 次。
-                if resp.status_code == 400 and '"code":-2011' in resp.text:
-                    print(f"  [BROKER] {method} {path} 订单已不存在(-2011)，不再重试")
-                    return {"__order_gone__": True}
+                # 确定性错误（重试无意义，直接返回）：这类错误的参数/状态在重试后
+                # 不会改变，空等 5 次只会浪费时间和限频配额。
+                #   -2011 Unknown order：订单已不存在（已成交/已撤/已触发）
+                #   -4028 Leverage not valid：该币种不支持请求的杠杆倍数
+                #   -1106 reduceonly sent when not required：双向持仓模式不许传 reduceOnly
+                if resp.status_code == 400:
+                    text = resp.text
+                    if '"code":-2011' in text:
+                        print(f"  [BROKER] {method} {path} 订单已不存在(-2011)，不再重试")
+                        return {"__order_gone__": True}
+                    if '"code":-4028' in text:
+                        print(f"  [BROKER] {method} {path} 杠杆不支持(-4028)，不再重试")
+                        return {}
+                    if '"code":-1106' in text:
+                        print(f"  [BROKER] {method} {path} 参数错误(-1106)，不再重试")
+                        return {}
                 print(f"  [BROKER] {method} {path} HTTP {resp.status_code}: "
                       f"{resp.text[:200]}, retry {attempt+1}/5")
                 # 若仍报时间戳错误，重新校准一次时间

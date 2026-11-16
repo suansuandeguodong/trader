@@ -8,6 +8,7 @@ testnet: false                         # false = 真实合约，true = 测试网
 min_volume_usdt: 18000000              # 24h 成交额下限（USDT）
 
 # ============ 信号参数 ============
+signal_interval: "15m"                 # 信号 K 线周期："15m" / "5m"（切换周期会自动同步 EMA、共振、收盘对齐）
 ema_period: 20                         # EMA 周期
 min_down_bars: 13                      # 向上拐头前需连续不涨最少根数
 min_up_bars: 13                        # 向下拐头前需连续不跌最少根数

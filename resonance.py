@@ -29,12 +29,14 @@ from reversal import calc_ema_series
 class ResonanceManager:
     """维护每个 symbol 的 15m EMA10 滚动历史，提供共振拐头判定。"""
 
-    def __init__(self, ema10_period: int = 10, window_size: int = 300):
+    def __init__(self, ema10_period: int = 10, window_size: int = 300,
+                 bar_interval_ms: int = 15 * 60 * 1000):
         self.ema10_period = ema10_period
         self.window_size = window_size
-        # 15m EMA10 滑动窗口（与 SemEMA20 同级别，period=10）
+        self.bar_interval_ms = bar_interval_ms
+        # 信号周期 EMA10 滑动窗口（与信号 EMA20 同级别，period=10）
         self.sema10 = SlidingEMA(period=ema10_period, window_size=window_size,
-                                 bar_interval_ms=15 * 60 * 1000)
+                                 bar_interval_ms=bar_interval_ms)
         # 每个 symbol 的 EMA10 滚动历史（旧→新，最多保留 3 根，含当前）
         # 结构：{symbol: [ema10, ...]}
         self._history: dict = {}
@@ -116,7 +118,7 @@ class ResonanceManager:
         if symbol is None:
             self.sema10 = SlidingEMA(period=self.ema10_period,
                                      window_size=self.window_size,
-                                     bar_interval_ms=15 * 60 * 1000)
+                                     bar_interval_ms=self.bar_interval_ms)
             self._history.clear()
         else:
             self.sema10.reset(symbol)

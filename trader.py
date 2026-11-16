@@ -31,7 +31,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from market import get_all_usdt_perpetuals, get_24hr_tickers, get_24hr_prices, get_15m_klines
+from market import get_all_usdt_perpetuals, get_24hr_tickers, get_24hr_prices, get_klines
 from sliding import SlidingEMA
 from reversal import EMA20Reversal
 from reversal_down import EMA20ReversalDown
@@ -50,6 +50,7 @@ with open(BASE_DIR / "config.yaml", "r", encoding="utf-8") as f:
     CFG = yaml.safe_load(f)
 
 MIN_VOLUME_USDT = CFG.get("min_volume_usdt", 18_000_000)
+SIGNAL_INTERVAL = CFG.get("signal_interval", "15m")  # 信号 K 线周期："15m" / "5m"
 EMA_PERIOD = CFG.get("ema_period", 20)
 MIN_DOWN_BARS = CFG.get("min_down_bars", 13)
 MIN_UP_BARS = CFG.get("min_up_bars", 13)
@@ -84,7 +85,19 @@ PULLBACK_WINDOW = CFG.get("pullback_window", 300)
 PULLBACK_WATCH_SECONDS = CFG.get("pullback_watch_seconds", 1800)
 PULLBACK_CHECK_EVERY = CFG.get("pullback_check_every", 60)
 
-BAR_INTERVAL_MS = 15 * 60 * 1000  # 15m
+def _interval_to_ms(interval: str) -> int:
+    """把币安 interval 字符串转成毫秒时长。支持 m/h/d 后缀。"""
+    unit = interval[-1].lower()
+    num = interval[:-1]
+    try:
+        n = int(num)
+    except ValueError:
+        return 15 * 60 * 1000
+    mul = {"m": 60 * 1000, "h": 3600 * 1000, "d": 86400 * 1000}
+    return n * mul.get(unit, 60 * 1000)
+
+
+BAR_INTERVAL_MS = _interval_to_ms(SIGNAL_INTERVAL)  # 信号 K 线周期（默认 15m）
 _running = True
 _notifier = None  # 企微通知器（main 里初始化，模块级函数复用）
 
@@ -107,7 +120,7 @@ def build_candidates() -> list:
 
 def _fetch_bars(sym, limit):
     try:
-        return sym, get_15m_klines(sym, limit=limit)
+        return sym, get_klines(sym, SIGNAL_INTERVAL, limit=limit)
     except Exception:
         return sym, None
 
@@ -805,7 +818,8 @@ def main():
         return
 
     # 滑动窗口 + 双方向状态机
-    sema = SlidingEMA(period=EMA_PERIOD, window_size=WINDOW_SIZE)
+    sema = SlidingEMA(period=EMA_PERIOD, window_size=WINDOW_SIZE,
+                      bar_interval_ms=BAR_INTERVAL_MS)
     rev_up = EMA20Reversal(min_down_bars=MIN_DOWN_BARS)
     rev_down = EMA20ReversalDown(min_up_bars=MIN_UP_BARS)
 
@@ -819,7 +833,8 @@ def main():
     ) if ENABLE_PULLBACK else None
 
     # EMA10/20 共振确认管理器（resonance 模式）
-    resonance_mgr = ResonanceManager(ema10_period=10, window_size=WINDOW_SIZE)
+    resonance_mgr = ResonanceManager(ema10_period=10, window_size=WINDOW_SIZE,
+                                     bar_interval_ms=BAR_INTERVAL_MS)
 
     print("预热滑动窗口（并发拉历史 K 线 + 还原状态机）...")
     t0 = time.time()
@@ -1047,13 +1062,13 @@ def main():
                 print(f"[刷新] 异常: {e}")
             last_rescan = time.time()
 
-        # 对齐下一根 15m K 线收盘前 lead 秒
+        # 对齐下一根信号 K 线收盘前 lead 秒
         now = time.time()
         next_close = (now // (BAR_INTERVAL_MS / 1000) + 1) * (BAR_INTERVAL_MS / 1000)
         trigger_at = next_close - LEAD_SECONDS
         wait_s = trigger_at - now
         if wait_s > 0:
-            print(f"[{_ts()}] 等待下一根 15m K线收盘前 {LEAD_SECONDS} 秒触发 "
+            print(f"[{_ts()}] 等待下一根 {SIGNAL_INTERVAL} K线收盘前 {LEAD_SECONDS} 秒触发 "
                   f"({time.strftime('%H:%M:%S', time.localtime(trigger_at))})...\n")
             while wait_s > 0 and _running:
                 sleep = min(10, wait_s)

@@ -5,13 +5,14 @@ EMA20 高位拐头向下信号模块（15m K线）—— 与 reversal.py 对称�
   - EMA20 基于 15m K线收盘价计算
   - 拐头向下：某根 K 线收盘后，其 EMA20 < 前一根的 EMA20
   - 前置条件：该拐头 K 线之前，连续「至少 MIN_UP_BARS（默认 13）根」
-    EMA20 都是不跌的（后一根 >= 前一根），即这段内没有任何一根下跌
+    EMA20 都是严格上涨的（后一根 > 前一根），不允许走平（相等）
   - 不需要价格配合（不看收盘价 vs EMA20、不看阴阳线）
 
 实现为「状态机」：
-  - 每个 symbol 有一个「连续不跌计数」up_count
+  - 每个 symbol 有一个「连续严格上涨计数」up_count
   - 每根 15m K 线收盘，计算新的 EMA20 并更新：
-      - 若新 EMA20 >= 前 EMA20 → 上涨或平，up_count += 1
+      - 若新 EMA20 > 前 EMA20 → 严格上涨，up_count += 1
+      - 若新 EMA20 == 前 EMA20 → 走平，up_count 清零（打断连续性）
       - 若新 EMA20 < 前 EMA20 → 拐头：
           若 up_count >= MIN_UP_BARS → 触发信号（并复位 up_count=0）
           否则 → 只是普通下跌，up_count 复位为 0
@@ -126,9 +127,18 @@ class EMA20ReversalDown:
             }
             return triggered
 
-        # 不跌（curr_ema >= prev_ema）：计数 +1
+        if curr_ema > prev_ema:
+            # 严格上涨：计数 +1
+            self._state[symbol] = {
+                "up_count": up_count + 1,
+                "prev_ema": curr_ema,
+                "ema_history": hist,
+            }
+            return False
+
+        # 走平（curr_ema == prev_ema）：打断「连续严格上涨」，计数清零重新计
         self._state[symbol] = {
-            "up_count": up_count + 1,
+            "up_count": 0,
             "prev_ema": curr_ema,
             "ema_history": hist,
         }

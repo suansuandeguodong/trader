@@ -32,6 +32,11 @@ leverage: 50                           # 杠杆倍数（50x）
 no_trade_hour_start: 7                 # 禁开仓时段起点（本机时间小时），7:00 起禁
 no_trade_hour_end: 9                   # 禁开仓时段终点（本机时间小时），9:00 恢复（[start:00, end:00) 左闭右开）
 
+# ============ 策略模式 ============
+# resonance = 拐头 + EMA10/20 共振确认立即开仓（初始套出场：止损=信号开盘、止盈=入场±幅度一半）
+# pullback  = 3m 回调入场（止损=信号最低价/min前开盘，止盈=成交价±信号实体一半）
+strategy_mode: "resonance"
+
 # ============ 3m 回调入场 ============
 enable_pullback: true                  # 开关：15m拐头后等3m回调到EMA15再入场（false则退回原"信号即挂单"）
 pullback_ema_period: 15                # 3m 的 EMA 周期

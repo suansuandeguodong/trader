@@ -38,6 +38,7 @@ from reversal_down import EMA20ReversalDown
 from broker import BinanceFutures
 from risk import RiskManager
 from pullback import PullbackManager
+from resonance import ResonanceManager
 from wecom_notifier import WeComNotifier
 import trade_log as tlog
 
@@ -71,6 +72,9 @@ LEVERAGE = CFG.get("leverage", 50)
 # 禁开仓时段（本机时间，小时）
 NO_TRADE_HOUR_START = CFG.get("no_trade_hour_start", 7)
 NO_TRADE_HOUR_END = CFG.get("no_trade_hour_end", 9)
+
+# 策略模式：resonance = 拐头 + EMA10/20 共振确认立即开仓；pullback = 3m 回调入场
+STRATEGY_MODE = CFG.get("strategy_mode", "resonance")
 
 # 3m 回调入场
 ENABLE_PULLBACK = CFG.get("enable_pullback", True)
@@ -814,6 +818,9 @@ def main():
         risk_reward=RISK_REWARD,
     ) if ENABLE_PULLBACK else None
 
+    # EMA10/20 共振确认管理器（resonance 模式）
+    resonance_mgr = ResonanceManager(ema10_period=10, window_size=WINDOW_SIZE)
+
     print("预热滑动窗口（并发拉历史 K 线 + 还原状态机）...")
     t0 = time.time()
     warm = parallel_fetch(candidates, WARMUP_LIMIT, workers=MAX_WORKERS)
@@ -823,6 +830,8 @@ def main():
         sema.init_symbol(sym, closes, bar_times)
         rev_up.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
         rev_down.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
+        # resonance 模式：初始化 EMA10 窗口 + 历史基线
+        resonance_mgr.init_symbol(sym, closes, bar_times)
     print(f"预热完成: {len(warm)}/{len(candidates)} 就绪, 耗时 {time.time()-t0:.1f}s\n")
 
     def shutdown(sig=None, frame=None):
@@ -839,8 +848,8 @@ def main():
     monitor_thread.start()
     print("后台监控线程已启动（每 15 秒检查挂单成交 + 持仓）\n")
 
-    # 3m 回调监控线程（仅当启动 pullback 模式）
-    if ENABLE_PULLBACK and pullback_mgr is not None:
+    # 3m 回调监控线程（仅 pullback 模式启动）
+    if STRATEGY_MODE == "pullback" and ENABLE_PULLBACK and pullback_mgr is not None:
         pb_thread = threading.Thread(
             target=pullback_monitor_loop,
             args=(rm, pullback_mgr, PULLBACK_CHECK_EVERY),
@@ -893,6 +902,8 @@ def main():
                         # 实体涨幅过大，止损幅度毁灭，过滤
                         print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% > {MAX_BODY_PCT}%（实体过大）")
                     elif body_pct >= MIN_BODY_PCT:
+                        # 共振确认：信号前一根 EMA10 是否最低（history 截至 bar[-1]）
+                        resonance_ok = resonance_mgr.confirm(sym, "LONG")
                         meta = {
                             "bar_time": b["t"],
                             "open": o, "high": b["h"], "low": b["l"],
@@ -902,11 +913,13 @@ def main():
                             "body_pct": body_pct,
                             "ema_history": list(rev_up.get_ema_history(sym)),
                             "prev_open": prev_open,
+                            "resonance_ok": resonance_ok,
                         }
                         signals.append((sym, "LONG", o, c, meta))
                         tlog.log_signal(sym, "LONG", meta)
                         print(f"\n  >>> [信号·做多] {sym} 拐头向上 "
-                              f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%) <<<\n")
+                              f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%, "
+                              f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
                     elif body_pct < MIN_BODY_PCT:
                         print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% < {MIN_BODY_PCT}%")
 
@@ -919,6 +932,8 @@ def main():
                         # 实体跌幅过大，过滤
                         print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% < -{MAX_BODY_PCT}%（实体过大）")
                     elif body_pct <= -MIN_BODY_PCT:
+                        # 共振确认：信号前一根 EMA10 是否最高（history 截至 bar[-1]）
+                        resonance_ok = resonance_mgr.confirm(sym, "SHORT")
                         meta = {
                             "bar_time": b["t"],
                             "open": o, "high": b["h"], "low": b["l"],
@@ -928,13 +943,20 @@ def main():
                             "body_pct": body_pct,
                             "ema_history": list(rev_down.get_ema_history(sym)),
                             "prev_open": prev_open,
+                            "resonance_ok": resonance_ok,
                         }
                         signals.append((sym, "SHORT", o, c, meta))
                         tlog.log_signal(sym, "SHORT", meta)
                         print(f"\n  >>> [信号·做空] {sym} 拐头向下 "
-                              f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%) <<<\n")
+                              f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%, "
+                              f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
                     elif body_pct > -MIN_BODY_PCT:
                         print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% > {-MIN_BODY_PCT}%")
+
+                # 每根已收盘 K 线处理后，推进 EMA10 历史到当前根 bar[0]。
+                # 放在拐头判定之后，确保拐头触发时 resonance 的 history 仍停在
+                # bar[-1]，从而 confirm() 能正确比较 bar[-2] vs bar[-1]。
+                resonance_mgr.push_close(sym, b["t"], b["c"])
 
         # 信号处理：开仓（加锁，与后台监控线程互斥）
         if signals:
@@ -952,7 +974,14 @@ def main():
                         print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
                         continue
                     try:
-                        if ENABLE_PULLBACK and pullback_mgr is not None:
+                        if STRATEGY_MODE == "resonance":
+                            # 共振逻辑：拐头 + EMA10/20 共振确认 → 立即开仓（初始套出场）
+                            resonance_ok = meta.get("resonance_ok", False) if meta else False
+                            if not resonance_ok:
+                                print(f"  [跳过] {sym} {direction} 共振不成立（EMA10未同向拐头），放弃信号")
+                                continue
+                            open_trade(rm, sym, direction, o, c, meta)
+                        elif ENABLE_PULLBACK and pullback_mgr is not None:
                             # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA 再开仓
                             prev_open = meta.get("prev_open") if meta else None
                             sig_low = meta.get("low") if meta else None
@@ -1004,10 +1033,12 @@ def main():
                         sema.init_symbol(sym, closes, bar_times)
                         rev_up.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
                         rev_down.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
+                        resonance_mgr.init_symbol(sym, closes, bar_times)
                 for s in [x for x in candidates if x not in new_candidates]:
                     rev_up.reset(s)
                     rev_down.reset(s)
                     sema.reset(s)
+                    resonance_mgr.reset(s)
                     if pullback_mgr is not None:
                         pullback_mgr.reset(s)
                 candidates = new_candidates

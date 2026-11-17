@@ -8,7 +8,7 @@ testnet: false                         # false = 真实合约，true = 测试网
 min_volume_usdt: 18000000              # 24h 成交额下限（USDT）
 
 # ============ 信号参数 ============
-signal_interval: "15m"                 # 信号 K 线周期："15m" / "5m"（切换周期会自动同步 EMA、共振、收盘对齐）
+signal_interval: "5m"                  # 信号 K 线周期："15m" / "5m"（切换周期会自动同步 EMA、共振、收盘对齐）
 ema_period: 20                         # EMA 周期
 min_down_bars: 13                      # 向上拐头前需连续不涨最少根数
 min_up_bars: 13                        # 向下拐头前需连续不跌最少根数
@@ -18,7 +18,7 @@ max_body_pct: 3.0                     # 拐头 K 线实体涨/跌幅上限（%�
 # ============ 数据/计算 ============
 window_size: 300                       # 滑动窗口长度（根）
 warmup_limit: 500                      # 预热拉取历史 K 线数
-max_workers: 20                        # 并发线程数
+max_workers: 20                        # 并发线程数（实测并发20无问题，偶发慢请求靠 timeout 兜底即可）
 batch_size: 25                         # 每批拉取币数
 batch_interval: 1.5                    # 批间间隔（秒）
 rescan_interval: 14400                 # 候选池刷新间隔（秒）
@@ -30,8 +30,6 @@ risk_reward_ratio: 2.0                 # 盈亏比（止损:止盈 = 2:1，即�
 max_positions: 7                       # 最大同时持仓数
 cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（秒）= 15 分钟
 leverage: 50                           # 杠杆倍数（50x）
-no_trade_hour_start: 7                 # 禁开仓时段起点（本机时间小时），7:00 起禁
-no_trade_hour_end: 9                   # 禁开仓时段终点（本机时间小时），9:00 恢复（[start:00, end:00) 左闭右开）
 
 # ============ 策略模式 ============
 # resonance = 拐头 + EMA10/20 共振确认立即开仓（初始套出场：止损=信号开盘、止盈=入场±幅度一半）

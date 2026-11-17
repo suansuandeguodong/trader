@@ -12,28 +12,44 @@ import requests
 
 FAPI_BASE = "https://fapi.binance.com"
 
+# 模块级显式代理（由 trader.py 启动时调用 set_proxy 注入 config.yaml 的 proxy）。
+# 值为 None 时回退到环境变量 HTTP_PROXY/HTTPS_PROXY（向后兼容旧用法）。
+_PROXY = None
+
+
+def set_proxy(proxy: str):
+    """设置全局代理（如 config.yaml 里的 proxy）。传空串则清除，回退环境变量。"""
+    global _PROXY
+    _PROXY = proxy or None
+
 
 def _get_proxies() -> dict:
-    proxy = os.getenv("HTTP_PROXY", "") or os.getenv("HTTPS_PROXY", "")
+    proxy = _PROXY or os.getenv("HTTP_PROXY", "") or os.getenv("HTTPS_PROXY", "")
     return {"http": proxy, "https": proxy} if proxy else None
 
 
-def _fetch_json(url: str, params: dict = None, timeout: int = 12):
-    """REST 请求，带重试。失败返回空容器（list 接口返回 []，dict 接口返回 {}）。"""
+def _fetch_json(url: str, params: dict = None, timeout: int = 15,
+                max_retries: int = 3):
+    """REST 请求，带重试。失败返回空容器（list 接口返回 []，dict 接口返回 {}）。
+
+    timeout=15 是刻意的：币安 K 线接口在负载高时会「偶发响应慢（8~12 秒）」，
+    若 timeout 过短，这些稍慢但最终会成功的请求会被误杀成超时。实测串行/并发
+    请求成功率都高，个别慢请求给足 15 秒即可自然返回，避免空等重试。
+    """
     expects_list = "klines" in url or "exchangeInfo" in url
     proxies = _get_proxies()
 
-    for attempt in range(5):
+    for attempt in range(max_retries):
         try:
             resp = requests.get(url, params=params, timeout=timeout, proxies=proxies)
             if resp.status_code == 200:
                 return resp.json()
-            print(f"  [REST] {url} HTTP {resp.status_code}, retry {attempt+1}/5")
+            print(f"  [REST] {url} HTTP {resp.status_code}, retry {attempt+1}/{max_retries}")
         except Exception as e:
-            print(f"  [REST] {url} error: {e}, retry {attempt+1}/5")
+            print(f"  [REST] {url} error: {e}, retry {attempt+1}/{max_retries}")
         time.sleep(2 ** attempt)
 
-    print(f"  [REST] {url} all 5 retries exhausted")
+    print(f"  [REST] {url} all {max_retries} retries exhausted")
     return [] if expects_list else {}
 
 

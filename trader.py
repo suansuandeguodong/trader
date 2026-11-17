@@ -16,7 +16,6 @@ import signal
 import time
 import math
 import threading
-from datetime import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -31,6 +30,7 @@ except Exception:
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import market
 from market import get_all_usdt_perpetuals, get_24hr_tickers, get_24hr_prices, get_klines
 from sliding import SlidingEMA
 from reversal import EMA20Reversal
@@ -69,10 +69,6 @@ RISK_REWARD = CFG.get("risk_reward_ratio", 2.0)
 MAX_POSITIONS = CFG.get("max_positions", 7)
 CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
 LEVERAGE = CFG.get("leverage", 50)
-
-# 禁开仓时段（本机时间，小时）
-NO_TRADE_HOUR_START = CFG.get("no_trade_hour_start", 7)
-NO_TRADE_HOUR_END = CFG.get("no_trade_hour_end", 9)
 
 # 策略模式：resonance = 拐头 + EMA10/20 共振确认立即开仓；pullback = 3m 回调入场
 STRATEGY_MODE = CFG.get("strategy_mode", "resonance")
@@ -130,9 +126,16 @@ def _fetch_batch(symbols, limit, workers):
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_fetch_bars, s, limit): s for s in symbols}
         for fut in as_completed(futures):
-            sym, bars = fut.result()
-            if bars:
-                result[sym] = bars
+            sym = futures[fut]
+            try:
+                # 单个 symbol 的硬超时兜底：即使 _fetch_json 内部仍在重试，
+                # 也不阻塞整批（as_completed 本会等最慢的那个）。
+                sym, bars = fut.result(timeout=30)
+                if bars:
+                    result[sym] = bars
+            except Exception as e:
+                # 超时/异常：该币本轮放弃，记日志，下一轮再补
+                print(f"  [拉取] {sym} 超时放弃本轮: {type(e).__name__}")
     return result
 
 
@@ -565,24 +568,6 @@ def _notify(markdown: str):
         _notifier.send_markdown(markdown)
 
 
-def is_no_trade_time(now=None) -> bool:
-    """
-    判断当前是否处于禁开仓时段（本机时间）。
-
-    规则：NO_TRADE_HOUR_START:00:00 <= now < NO_TRADE_HOUR_END:00:00 时禁开。
-    即「7 点到 9 点」= 从 7:00:00 起到 9:00:00 前（不含 9:00 整点那一刻，9:00 恢复）。
-    now 可选，仅用于测试注入；不传则取本机当前本地时间。
-
-    用「到秒」的边界（而非小时字段），避免把「9点整」误扩成「整个 9 点小时」。
-    """
-    if now is None:
-        now = datetime.now().astimezone()  # 本机本地时区时间
-    minutes_of_day = now.hour * 60 + now.minute
-    start = NO_TRADE_HOUR_START * 60
-    end = NO_TRADE_HOUR_END * 60
-    return start <= minutes_of_day < end
-
-
 def pullback_monitor_loop(rm: RiskManager, pullback_mgr: PullbackManager,
                           check_every: int = 15):
     """
@@ -676,10 +661,6 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
     传了（3m 回调入场场景）则直接用传入的三价。
     half_body: 信号K线实体的一半（3m策略），非 None 时成交后用真实成交价重算止盈。
     """
-    # 兜底守卫：二次确认不在禁开仓时段（防御任何绕过主循环拦截的开仓路径）
-    if is_no_trade_time():
-        print(f"  [非开仓时段] {sym} {direction} 处于禁开仓时段，放弃开仓")
-        return
     if entry is None or stop is None or tp is None:
         entry, stop, tp = rm.compute_prices(direction, o, c)
     qty = rm.compute_qty(sym, entry)
@@ -785,6 +766,11 @@ def main():
     api_secret = os.getenv("BINANCE_API_SECRET", "")
     proxy = CFG.get("proxy", "")
     testnet = CFG.get("testnet", False)
+
+    # 关键：把 config.yaml 的 proxy 注入 market 模块，使拉 K 线也走代理，
+    # 否则 market 直连币安在国内网络下会频繁超时（下单走 broker 代理，
+    # 拉数据却走环境变量，二者不一致会导致「下单正常但拉 K 线超时」）。
+    market.set_proxy(proxy)
 
     if not api_key or not api_secret:
         print("[错误] 未配置 API 密钥，请在 .env 中填写 BINANCE_API_KEY / BINANCE_API_SECRET")
@@ -978,10 +964,6 @@ def main():
             print(f"[{_ts()}] 本轮共 {len(signals)} 个信号，处理开仓...")
             with _rm_lock:
                 for sym, direction, o, c, meta in signals:
-                    if is_no_trade_time():
-                        print(f"  [非开仓时段] {sym} {direction} 当前处于禁开仓时段 "
-                              f"({NO_TRADE_HOUR_START}:00-{NO_TRADE_HOUR_END}:00)，丢弃信号")
-                        continue
                     if rm.has_position_or_order(sym, direction):
                         print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
                         continue

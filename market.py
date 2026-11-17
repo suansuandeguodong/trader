@@ -16,11 +16,43 @@ FAPI_BASE = "https://fapi.binance.com"
 # 值为 None 时回退到环境变量 HTTP_PROXY/HTTPS_PROXY（向后兼容旧用法）。
 _PROXY = None
 
+# 连接池复用：避免每请求都新建 TCP+TLS 握手（这是 Read timed out 高发的主因之一）。
+# 单线程内并发有限，池大小给足即可；复用 keep-alive 连接显著降低抖动带来的握手开销。
+_SESSION = None
+
 
 def set_proxy(proxy: str):
     """设置全局代理（如 config.yaml 里的 proxy）。传空串则清除，回退环境变量。"""
     global _PROXY
     _PROXY = proxy or None
+    # 代理变了，连接池要重建，否则新代理不生效
+    _reset_session()
+
+
+def _reset_session():
+    global _SESSION
+    if _SESSION is not None:
+        try:
+            _SESSION.close()
+        except Exception:
+            pass
+    _SESSION = None
+
+
+def _get_session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        # 代理在 session 层固定；连接池复用 keep-alive
+        proxies = _get_proxies()
+        if proxies:
+            s.proxies.update(proxies)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=32, pool_maxsize=32, max_retries=0)
+        s.mount("https://", adapter)
+        s.mount("http://", adapter)
+        _SESSION = s
+    return _SESSION
 
 
 def _get_proxies() -> dict:
@@ -29,19 +61,20 @@ def _get_proxies() -> dict:
 
 
 def _fetch_json(url: str, params: dict = None, timeout: int = 15,
-                max_retries: int = 3):
+                max_retries: int = 2):
     """REST 请求，带重试。失败返回空容器（list 接口返回 []，dict 接口返回 {}）。
 
-    timeout=15 是刻意的：币安 K 线接口在负载高时会「偶发响应慢（8~12 秒）」，
-    若 timeout 过短，这些稍慢但最终会成功的请求会被误杀成超时。实测串行/并发
-    请求成功率都高，个别慢请求给足 15 秒即可自然返回，避免空等重试。
+    timeout 拆成 (connect, read)：connect 短、read 长。connect 阶段快速失败，
+    避免「连不上还死等」；read 阶段保留长超时等慢响应自然返回。走连接池复用。
     """
     expects_list = "klines" in url or "exchangeInfo" in url
-    proxies = _get_proxies()
+    session = _get_session()
+    # connect 5s（快速探活），read 用传入 timeout
+    req_timeout = (5, timeout)
 
     for attempt in range(max_retries):
         try:
-            resp = requests.get(url, params=params, timeout=timeout, proxies=proxies)
+            resp = session.get(url, params=params, timeout=req_timeout)
             if resp.status_code == 200:
                 return resp.json()
             print(f"  [REST] {url} HTTP {resp.status_code}, retry {attempt+1}/{max_retries}")

@@ -16,6 +16,7 @@ import signal
 import time
 import math
 import threading
+import queue
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -59,6 +60,7 @@ MAX_BODY_PCT = CFG.get("max_body_pct", 3.0)
 WINDOW_SIZE = CFG.get("window_size", 300)
 WARMUP_LIMIT = CFG.get("warmup_limit", 500)
 MAX_WORKERS = CFG.get("max_workers", 20)
+JUDGE_WORKERS = CFG.get("judge_workers", 8)  # 判断信号并发度（纯CPU，独立于拉取线程池）
 BATCH_SIZE = CFG.get("batch_size", 25)
 BATCH_INTERVAL = CFG.get("batch_interval", 1.5)
 RESCAN_INTERVAL = CFG.get("rescan_interval", 14400)
@@ -150,6 +152,69 @@ def parallel_fetch(symbols, limit, workers=MAX_WORKERS,
         if i + batch_size < len(symbols):
             time.sleep(batch_interval)
     return result
+
+
+# ── 完整 K 线缓存（内存换速度）：{symbol: [完整K线dict, ...]}，旧→新 ──
+# 预热时全量填充，每轮增量追加，判断时从缓存读，避免重复拉取。
+# 每根 K 线含 o/h/l/c/v/t 五元组 + 时间戳，用于判断拐头、止损 prev_open 等。
+_bars_cache = {}
+# 缓存访问锁（候选池刷新时会并发读写）
+_bars_cache_lock = threading.Lock()
+
+
+def cache_add_bars(symbol, bars):
+    """把增量 K 线按 bar_time 去重后追加进缓存。bars 须旧→新。"""
+    if not bars:
+        return
+    with _bars_cache_lock:
+        existing = _bars_cache.setdefault(symbol, [])
+        last_t = existing[-1]["t"] if existing else 0
+        for b in bars:
+            if b["t"] > last_t:
+                existing.append(b)
+                last_t = b["t"]
+        # 滑出最旧的，控制内存
+        if len(existing) > WINDOW_SIZE:
+            del existing[:len(existing) - WINDOW_SIZE]
+
+
+def cache_clear_symbol(symbol):
+    """候选池移除某 symbol 时清理缓存。"""
+    with _bars_cache_lock:
+        _bars_cache.pop(symbol, None)
+
+
+# 哨兵：标记一轮拉取结束
+_fetch_sentinel = object()
+
+
+def _produce_bars(symbols, limit, workers, out_queue):
+    """生产者：线程池并发拉取，谁先完成谁 put 进有界队列。
+
+    放独立函数，便于作为生产者线程启动，与消费者（主循环）解耦。
+    """
+    def _worker(sym):
+        try:
+            sym, bars = _fetch_bars(sym, limit)
+        except Exception as e:
+            bars = None
+            print(f"  [拉取] {sym} 异常: {type(e).__name__}")
+        return sym, bars
+
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(_worker, s) for s in symbols]
+            for fut in as_completed(futures):
+                try:
+                    sym, bars = fut.result(timeout=30)
+                except Exception as e:
+                    print(f"  [拉取] 超时放弃本轮: {type(e).__name__}")
+                    continue
+                if bars:
+                    out_queue.put((sym, bars))  # 有界队列满时阻塞 = 背压
+    finally:
+        # 无论异常与否，都要放入哨兵，否则消费者会永久阻塞
+        out_queue.put(_fetch_sentinel)
 
 
 # ── 持仓管理 ──
@@ -833,6 +898,8 @@ def main():
         rev_down.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
         # resonance 模式：初始化 EMA10 窗口 + 历史基线
         resonance_mgr.init_symbol(sym, closes, bar_times)
+        # 缓存完整 K 线（含 o/h/l/c/v/t），后续增量判断复用
+        cache_add_bars(sym, bars)
     print(f"预热完成: {len(warm)}/{len(candidates)} 就绪, 耗时 {time.time()-t0:.1f}s\n")
 
     def shutdown(sig=None, frame=None):
@@ -865,142 +932,215 @@ def main():
     def _ts():
         return time.strftime("%H:%M:%S")
 
+    def _process_signals(signals, rm, _rm_lock):
+        """处理一批信号开仓。返回处理数量（供日志）。"""
+        n = 0
+        if not signals:
+            return n
+        print(f"[{_ts()}] 处理 {len(signals)} 个信号开仓...")
+        with _rm_lock:
+            for sym, direction, o, c, meta in signals:
+                if rm.has_position_or_order(sym, direction):
+                    print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
+                    continue
+                if not rm.can_open_new():
+                    print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
+                    continue
+                try:
+                    if STRATEGY_MODE == "resonance":
+                        resonance_ok = meta.get("resonance_ok", False) if meta else False
+                        if not resonance_ok:
+                            print(f"  [跳过] {sym} {direction} 共振不成立（EMA10未同向拐头），放弃信号")
+                            continue
+                        open_trade(rm, sym, direction, o, c, meta)
+                    elif ENABLE_PULLBACK and pullback_mgr is not None:
+                        prev_open = meta.get("prev_open") if meta else None
+                        sig_low = meta.get("low") if meta else None
+                        sig_high = meta.get("high") if meta else None
+                        sig_close_ms = (meta.get("bar_time") if meta else 0) + BAR_INTERVAL_MS
+                        ok = pullback_mgr.add_signal(
+                            sym, direction, o, c, sig_low, sig_high,
+                            prev_open, sig_close_ms)
+                        if ok:
+                            print(f"  [观察] {sym} {direction} 15m拐头，等待3m回调到EMA")
+                            _notify(
+                                f"**👀 等待回踩入场 · {sym}**\n"
+                                f"\n"
+                                f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
+                                f"15m已拐头，等待价格回调到 3m EMA 再挂单。"
+                            )
+                        else:
+                            print(f"  [跳过] {sym} {direction} 已在观察中，忽略重复")
+                    else:
+                        open_trade(rm, sym, direction, o, c, meta)
+                except Exception as e:
+                    print(f"  [开仓异常] {sym}: {e}")
+                n += 1
+        return n
+
+    def _judge_symbol(sym, bars, now_ms):
+        """判断单个 symbol 的 K 线，返回该币本轮产生的信号列表。
+
+        纯计算 + 更新按 symbol 隔离的状态机（sema/rev_up/rev_down/resonance_mgr），
+        不同 symbol 可并发调用（各自状态字典 key 隔离，GIL 保证 dict 操作原子）。
+        返回 signals: [(sym, direction, o, c, meta), ...]
+        """
+        signals = []
+        for idx, b in enumerate(bars):
+            bar_close_ms = b["t"] + BAR_INTERVAL_MS
+            if bar_close_ms > now_ms + LEAD_SECONDS * 1000:
+                continue
+            ema = sema.push_close(sym, b["t"], b["c"])
+            if ema is None:
+                continue
+            o = b["o"]
+            c = b["c"]
+            # 信号K线前一根的开盘价（止损比较用）
+            prev_open = bars[idx - 1]["o"] if idx > 0 else None
+
+            # 向上拐头（做多）
+            up_before = rev_up.get_down_count(sym)
+            is_up = rev_up.on_15m_close(sym, ema)
+            if is_up:
+                body_pct = (c - o) / o * 100 if o > 0 else 0.0
+                if body_pct > MAX_BODY_PCT:
+                    print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% > {MAX_BODY_PCT}%（实体过大）")
+                elif body_pct >= MIN_BODY_PCT:
+                    resonance_ok = resonance_mgr.confirm(sym, "LONG")
+                    meta = {
+                        "bar_time": b["t"],
+                        "open": o, "high": b["h"], "low": b["l"],
+                        "close": c, "volume": b["v"],
+                        "ema": ema,
+                        "down_count": up_before,
+                        "body_pct": body_pct,
+                        "ema_history": list(rev_up.get_ema_history(sym)),
+                        "prev_open": prev_open,
+                        "resonance_ok": resonance_ok,
+                    }
+                    signals.append((sym, "LONG", o, c, meta))
+                    tlog.log_signal(sym, "LONG", meta)
+                    print(f"\n  >>> [信号·做多] {sym} 拐头向上 "
+                          f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%, "
+                          f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
+                elif body_pct < MIN_BODY_PCT:
+                    print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% < {MIN_BODY_PCT}%")
+
+            # 向下拐头（做空）
+            down_before = rev_down.get_up_count(sym)
+            is_down = rev_down.on_15m_close(sym, ema)
+            if is_down:
+                body_pct = (c - o) / o * 100 if o > 0 else 0.0
+                if body_pct < -MAX_BODY_PCT:
+                    print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% < -{MAX_BODY_PCT}%（实体过大）")
+                elif body_pct <= -MIN_BODY_PCT:
+                    resonance_ok = resonance_mgr.confirm(sym, "SHORT")
+                    meta = {
+                        "bar_time": b["t"],
+                        "open": o, "high": b["h"], "low": b["l"],
+                        "close": c, "volume": b["v"],
+                        "ema": ema,
+                        "up_count": down_before,
+                        "body_pct": body_pct,
+                        "ema_history": list(rev_down.get_ema_history(sym)),
+                        "prev_open": prev_open,
+                        "resonance_ok": resonance_ok,
+                    }
+                    signals.append((sym, "SHORT", o, c, meta))
+                    tlog.log_signal(sym, "SHORT", meta)
+                    print(f"\n  >>> [信号·做空] {sym} 拐头向下 "
+                          f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%, "
+                          f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
+                elif body_pct > -MIN_BODY_PCT:
+                    print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% > {-MIN_BODY_PCT}%")
+
+            # 推进 EMA10 历史（确保下根 bar[-1] 判断时 history 停在当前根）
+            resonance_mgr.push_close(sym, b["t"], b["c"])
+
+        return signals
+
     while _running:
         iteration += 1
         loop_start = time.time()
 
-        print(f"[{_ts()}] 第{iteration}轮：拉取 {len(candidates)} 币最新 K线...")
-        data = parallel_fetch(candidates, 3, workers=MAX_WORKERS)
-        fetch_s = time.time() - loop_start
-        print(f"[{_ts()}] 拉取完成 {len(data)}/{len(candidates)} 币, 耗时 {fetch_s:.1f}s")
+        print(f"[{_ts()}] 第{iteration}轮：生产者拉取 {len(candidates)} 币 → 并发判断 → 串行下单")
 
-        now_ms = int(time.time() * 1000)
-        new_closed = 0
-        signals = []  # (sym, direction, open, close)
+        # ── 三级流水线：生产者拉取 → 判断线程池并发判断 → 下单线程串行下单 ──
+        # 1) fetch_queue：生产者(_produce_bars) 并发拉取，随完成随放入
+        # 2) judge 线程池：并发取 (sym,bars) 调 _judge_symbol，信号塞入 signal_queue
+        # 3) order 线程：串行从 signal_queue 取信号，_process_signals 拿 _rm_lock 下单
+        # 关键：判断纯 CPU 可并发（状态机按 symbol 隔离），下单受币安限流必须串行。
+        fetch_queue = queue.Queue(maxsize=max(8, MAX_WORKERS * 2))
+        signal_queue = queue.Queue()  # 信号量少，不设上限
 
-        for sym, bars in data.items():
-            if not bars:
-                continue
-            for idx, b in enumerate(bars):
-                bar_close_ms = b["t"] + BAR_INTERVAL_MS
-                if bar_close_ms > now_ms + LEAD_SECONDS * 1000:
+        producer = threading.Thread(
+            target=_produce_bars,
+            args=(list(candidates), 2, MAX_WORKERS, fetch_queue),
+            daemon=True,
+        )
+        producer.start()
+
+        # 判断线程池 worker：消费 fetch_queue，产出信号
+        judge_pool = ThreadPoolExecutor(max_workers=JUDGE_WORKERS)
+
+        def _judge_worker():
+            """单个判断 worker：持续从 fetch_queue 取币判断，直到哨兵退出。"""
+            while True:
+                try:
+                    item = fetch_queue.get(timeout=3.0)
+                except queue.Empty:
+                    # 生产者可能还在拉，稍等继续；生产者死了且队列空则退出
+                    if not producer.is_alive() and fetch_queue.empty():
+                        break
                     continue
-                ema = sema.push_close(sym, b["t"], b["c"])
-                if ema is None:
-                    continue
-                new_closed += 1
-                o = b["o"]
-                c = b["c"]
-                # 信号K线前一根的开盘价（止损比较用）
-                prev_open = bars[idx - 1]["o"] if idx > 0 else None
+                if item is _fetch_sentinel:
+                    break  # 哨兵：本轮数据已取尽，退出 worker
+                sym, bars = item
+                now_ms = int(time.time() * 1000)
+                # 增量合并进缓存，判断时从缓存读取完整序列（前一根 prev_open 从缓存取）
+                cache_add_bars(sym, bars)
+                with _bars_cache_lock:
+                    full = list(_bars_cache.get(sym, []))
+                sigs = _judge_symbol(sym, full, now_ms)
+                for sig in sigs:
+                    signal_queue.put(sig)
 
-                # 向上拐头（做多）
-                up_before = rev_up.get_down_count(sym)
-                is_up = rev_up.on_15m_close(sym, ema)
-                if is_up:
-                    body_pct = (c - o) / o * 100 if o > 0 else 0.0
-                    if body_pct > MAX_BODY_PCT:
-                        # 实体涨幅过大，止损幅度毁灭，过滤
-                        print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% > {MAX_BODY_PCT}%（实体过大）")
-                    elif body_pct >= MIN_BODY_PCT:
-                        # 共振确认：信号前一根 EMA10 是否最低（history 截至 bar[-1]）
-                        resonance_ok = resonance_mgr.confirm(sym, "LONG")
-                        meta = {
-                            "bar_time": b["t"],
-                            "open": o, "high": b["h"], "low": b["l"],
-                            "close": c, "volume": b["v"],
-                            "ema": ema,
-                            "down_count": up_before,
-                            "body_pct": body_pct,
-                            "ema_history": list(rev_up.get_ema_history(sym)),
-                            "prev_open": prev_open,
-                            "resonance_ok": resonance_ok,
-                        }
-                        signals.append((sym, "LONG", o, c, meta))
-                        tlog.log_signal(sym, "LONG", meta)
-                        print(f"\n  >>> [信号·做多] {sym} 拐头向上 "
-                              f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%, "
-                              f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
-                    elif body_pct < MIN_BODY_PCT:
-                        print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% < {MIN_BODY_PCT}%")
+        # 启动判断线程池
+        judge_futures = [judge_pool.submit(_judge_worker) for _ in range(JUDGE_WORKERS)]
+        judge_pool.shutdown(wait=False)
 
-                # 向下拐头（做空）
-                down_before = rev_down.get_up_count(sym)
-                is_down = rev_down.on_15m_close(sym, ema)
-                if is_down:
-                    body_pct = (c - o) / o * 100 if o > 0 else 0.0
-                    if body_pct < -MAX_BODY_PCT:
-                        # 实体跌幅过大，过滤
-                        print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% < -{MAX_BODY_PCT}%（实体过大）")
-                    elif body_pct <= -MIN_BODY_PCT:
-                        # 共振确认：信号前一根 EMA10 是否最高（history 截至 bar[-1]）
-                        resonance_ok = resonance_mgr.confirm(sym, "SHORT")
-                        meta = {
-                            "bar_time": b["t"],
-                            "open": o, "high": b["h"], "low": b["l"],
-                            "close": c, "volume": b["v"],
-                            "ema": ema,
-                            "up_count": down_before,
-                            "body_pct": body_pct,
-                            "ema_history": list(rev_down.get_ema_history(sym)),
-                            "prev_open": prev_open,
-                            "resonance_ok": resonance_ok,
-                        }
-                        signals.append((sym, "SHORT", o, c, meta))
-                        tlog.log_signal(sym, "SHORT", meta)
-                        print(f"\n  >>> [信号·做空] {sym} 拐头向下 "
-                              f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%, "
-                              f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
-                    elif body_pct > -MIN_BODY_PCT:
-                        print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% > {-MIN_BODY_PCT}%")
+        # 下单线程：串行消费 signal_queue，收到「结束哨兵」即排空退出
+        _order_sentinel = object()
 
-                # 每根已收盘 K 线处理后，推进 EMA10 历史到当前根 bar[0]。
-                # 放在拐头判定之后，确保拐头触发时 resonance 的 history 仍停在
-                # bar[-1]，从而 confirm() 能正确比较 bar[-2] vs bar[-1]。
-                resonance_mgr.push_close(sym, b["t"], b["c"])
+        def _order_worker():
+            """串行下单：从 signal_queue 取信号开仓，直到收到结束哨兵。"""
+            while True:
+                sig = signal_queue.get()  # 阻塞等信号；判断线程结束时会放哨兵唤醒
+                if sig is _order_sentinel:
+                    break
+                _process_signals([sig], rm, _rm_lock)
 
-        # 信号处理：开仓（加锁，与后台监控线程互斥）
-        if signals:
-            print(f"[{_ts()}] 本轮共 {len(signals)} 个信号，处理开仓...")
-            with _rm_lock:
-                for sym, direction, o, c, meta in signals:
-                    if rm.has_position_or_order(sym, direction):
-                        print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
-                        continue
-                    if not rm.can_open_new():
-                        print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
-                        continue
-                    try:
-                        if STRATEGY_MODE == "resonance":
-                            # 共振逻辑：拐头 + EMA10/20 共振确认 → 立即开仓（初始套出场）
-                            resonance_ok = meta.get("resonance_ok", False) if meta else False
-                            if not resonance_ok:
-                                print(f"  [跳过] {sym} {direction} 共振不成立（EMA10未同向拐头），放弃信号")
-                                continue
-                            open_trade(rm, sym, direction, o, c, meta)
-                        elif ENABLE_PULLBACK and pullback_mgr is not None:
-                            # 3m 回调入场：登记为「观察中」，等 3m 回调触碰 EMA 再开仓
-                            prev_open = meta.get("prev_open") if meta else None
-                            sig_low = meta.get("low") if meta else None
-                            sig_high = meta.get("high") if meta else None
-                            sig_close_ms = (meta.get("bar_time") if meta else 0) + BAR_INTERVAL_MS
-                            ok = pullback_mgr.add_signal(
-                                sym, direction, o, c, sig_low, sig_high,
-                                prev_open, sig_close_ms)
-                            if ok:
-                                print(f"  [观察] {sym} {direction} 15m拐头，等待3m回调到EMA")
-                                _notify(
-                                    f"**👀 等待回踩入场 · {sym}**\n"
-                                    f"\n"
-                                    f"方向: **{'做多 LONG' if direction == 'LONG' else '做空 SHORT'}**\n"
-                                    f"15m已拐头，等待价格回调到 3m EMA 再挂单。"
-                                )
-                            else:
-                                print(f"  [跳过] {sym} {direction} 已在观察中，忽略重复")
-                        else:
-                            open_trade(rm, sym, direction, o, c, meta)
-                    except Exception as e:
-                        print(f"  [开仓异常] {sym}: {e}")
+        order_thread = threading.Thread(target=_order_worker, daemon=True)
+        order_thread.start()
+
+        # 等待：生产者完成 → 投 fetch 哨兵让 judge 收尾 → 全部判断完 → 投 order 哨兵
+        producer.join()
+        for _ in range(JUDGE_WORKERS):
+            fetch_queue.put(_fetch_sentinel)
+        for f in judge_futures:
+            try:
+                f.result(timeout=15)
+            except Exception:
+                pass
+        judge_pool.shutdown(wait=True)
+        # 判断全部结束后，放 order 哨兵唤醒下单线程退出（即便无信号也立刻退出，不空等）
+        signal_queue.put(_order_sentinel)
+        order_thread.join(timeout=15)
+
+        fetched = len(candidates)  # 用于日志（本轮拉取币数量）
+
+        # 轮末日志
+        print(f"[{_ts()}] 本轮流式处理完成, 耗时 {time.time()-loop_start:.1f}s")
 
         # 管理挂单 + 持仓（撤单 / 挂止盈止损 / 同步），加锁
         try:
@@ -1031,11 +1171,13 @@ def main():
                         rev_up.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
                         rev_down.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
                         resonance_mgr.init_symbol(sym, closes, bar_times)
+                        cache_add_bars(sym, bars)
                 for s in [x for x in candidates if x not in new_candidates]:
                     rev_up.reset(s)
                     rev_down.reset(s)
                     sema.reset(s)
                     resonance_mgr.reset(s)
+                    cache_clear_symbol(s)
                     if pullback_mgr is not None:
                         pullback_mgr.reset(s)
                 candidates = new_candidates

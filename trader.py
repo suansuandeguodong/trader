@@ -74,7 +74,7 @@ NOTIONAL_USDT = CFG.get("order_notional_usdt", 30.0)
 RISK_REWARD = CFG.get("risk_reward_ratio", 2.0)
 MAX_POSITIONS = CFG.get("max_positions", 7)
 CANCEL_TIMEOUT_SEC = CFG.get("cancel_timeout_sec", 900)
-LEVERAGE = CFG.get("leverage", 50)
+LEVERAGE = CFG.get("leverage", 25)
 
 # 策略模式：resonance = 拐头 + EMA10/20 共振确认立即开仓；pullback = 3m 回调入场
 STRATEGY_MODE = CFG.get("strategy_mode", "resonance")
@@ -971,23 +971,24 @@ def main():
                 pullback_mgr.reset(s)
 
     def _sleep_until_rest_end():
-        """一次性 sleep 到 rest_end（本机时间），分段 sleep 便于响应退出信号。"""
-        def _to_min(t):
-            h, m = t.split(":")
-            return int(h) * 60 + int(m)
-        e = _to_min(REST_END)
+        """一次性 sleep 到 rest_end（本机时间），分段 sleep 便于响应退出信号。
+
+        用绝对时间点计算目标时刻，正确处理边界：当 now == rest_end 时立即退出，
+        跨午夜场景也能正确收敛（rest_end 是「今天的 HH:MM」）。
+        """
+        h, m = REST_END.split(":")
         while _running:
             now = time.localtime()
-            hm = now.tm_hour * 60 + now.tm_min
-            # 计算到 rest_end 的分钟差（支持跨午夜）
-            if e > hm:
-                diff_min = e - hm
-            else:
-                diff_min = (e + 24 * 60) - hm
-            if diff_min <= 0:
+            # 构造「今天 rest_end」的绝对时间；若已过（now 的时分 > rest_end），
+            # 说明 rest_end 已在今天过去，理论上此刻不应再睡（由 _is_rest_time 保证）。
+            target = time.mktime((now.tm_year, now.tm_mon, now.tm_mday,
+                                  int(h), int(m), 0, now.tm_wday, now.tm_yday, now.tm_isdst))
+            now_ts = time.time()
+            # 若目标时刻已到或已过（含恰好相等），立即退出
+            if target <= now_ts:
                 break
             # 分段 sleep（最多 60 秒一段），便于响应 Ctrl+C / _running=False
-            sleep_s = min(60, diff_min * 60)
+            sleep_s = min(60, target - now_ts)
             time.sleep(sleep_s)
 
     _do_warmup(candidates)

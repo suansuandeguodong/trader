@@ -35,7 +35,7 @@ order_notional_usdt: 30.0              # 每笔名义仓位（USDT）
 risk_reward_ratio: 2.0                 # 盈亏比（止损:止盈 = 2:1，即亏2赚1）
 max_positions: 7                       # 最大同时持仓数
 cancel_timeout_sec: 900                # 开仓限价单未成交撤单时间（秒）= 15 分钟
-leverage: 50                           # 杠杆倍数（50x）
+leverage: 25                           # 杠杆倍数（25x）
 
 # ============ 策略模式 ============
 # resonance = 拐头 + EMA10/20 共振确认立即开仓（初始套出场：止损=信号开盘、止盈=入场±幅度一半）

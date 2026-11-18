@@ -64,17 +64,16 @@ def _fetch_json(url: str, params: dict = None, timeout: int = 15,
                 max_retries: int = 2):
     """REST 请求，带重试。失败返回空容器（list 接口返回 []，dict 接口返回 {}）。
 
-    timeout 拆成 (connect, read)：connect 短、read 长。connect 阶段快速失败，
-    避免「连不上还死等」；read 阶段保留长超时等慢响应自然返回。走连接池复用。
+    timeout=15 是刻意的：币安 K 线接口在负载高时会偶发响应慢（8~12s），
+    若 timeout 过短，这些稍慢但最终会成功的请求会被误杀成超时，导致预热/拉取缺币。
+    走连接池复用。
     """
     expects_list = "klines" in url or "exchangeInfo" in url
     session = _get_session()
-    # connect 5s（快速探活），read 用传入 timeout
-    req_timeout = (5, timeout)
 
     for attempt in range(max_retries):
         try:
-            resp = session.get(url, params=params, timeout=req_timeout)
+            resp = session.get(url, params=params, timeout=timeout)
             if resp.status_code == 200:
                 return resp.json()
             print(f"  [REST] {url} HTTP {resp.status_code}, retry {attempt+1}/{max_retries}")

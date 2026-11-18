@@ -12,8 +12,8 @@ signal_interval: "5m"                  # 信号 K 线周期："15m" / "5m"（切
 ema_period: 20                         # EMA 周期
 min_down_bars: 13                      # 向上拐头前需连续不涨最少根数
 min_up_bars: 13                        # 向下拐头前需连续不跌最少根数
-min_body_pct: 1.0                      # 拐头 K 线实体涨/跌幅下限（%）
-max_body_pct: 3.0                     # 拐头 K 线实体涨/跌幅上限（%），超过则不交易（止损幅度过大）
+min_body_pct: 0.8                      # 拐头 K 线实体涨/跌幅下限（%）
+max_body_pct: 1.9                     # 拐头 K 线实体涨/跌幅上限（%），超过则不交易（止损幅度过大）
 
 # ============ 数据/计算 ============
 window_size: 300                       # 滑动窗口长度（根）
@@ -22,7 +22,7 @@ max_workers: 20                        # 并发线程数（实测并发20无问�
 batch_size: 25                         # 每批拉取币数
 batch_interval: 1.5                    # 批间间隔（秒）
 rescan_interval: 14400                 # 候选池刷新间隔（秒）
-lead_seconds: 15                       # 15m K 线收盘前提前触发秒数
+lead_seconds: 10                       # 15m K 线收盘前提前触发秒数
 
 # ============ 交易规则 ============
 order_notional_usdt: 30.0              # 每笔名义仓位（USDT）

@@ -66,6 +66,10 @@ BATCH_INTERVAL = CFG.get("batch_interval", 1.5)
 RESCAN_INTERVAL = CFG.get("rescan_interval", 14400)
 LEAD_SECONDS = CFG.get("lead_seconds", 15)
 
+# ── 休息时段：本机时间在此区间内，停止拉取/判断/开仓，一次性 sleep 到结束 ──
+REST_START = CFG.get("rest_start", "")   # 形如 "19:57"，空串表示不启用
+REST_END = CFG.get("rest_end", "")       # 形如 "23:57"，空串表示不启用
+
 NOTIONAL_USDT = CFG.get("order_notional_usdt", 30.0)
 RISK_REWARD = CFG.get("risk_reward_ratio", 2.0)
 MAX_POSITIONS = CFG.get("max_positions", 7)
@@ -604,6 +608,22 @@ def _place_stop_tp(rm: RiskManager, t, qty=None, fill_price=None):
 _rm_lock = threading.Lock()
 
 
+def _is_rest_time(now=None):
+    """判断当前本机时间是否在休息时段内（模块级，供主循环和监控线程共用）。"""
+    if not REST_START or not REST_END:
+        return False
+    now = now if now is not None else time.localtime()
+    hm = now.tm_hour * 60 + now.tm_min
+    def _to_min(t):
+        h, m = t.split(":")
+        return int(h) * 60 + int(m)
+    s = _to_min(REST_START)
+    e = _to_min(REST_END)
+    if s <= e:
+        return s <= hm < e
+    return hm >= s or hm < e
+
+
 def monitor_loop(rm: RiskManager):
     """
     后台监控线程：每 15 秒检查一次挂单成交状态 + 持仓状态。
@@ -611,16 +631,20 @@ def monitor_loop(rm: RiskManager):
     解决「开仓单延迟成交后，主循环每 15 分钟才检查一次，导致成交后
     长时间不挂止盈止损」的问题。这个线程持续高频检查，成交后很快
     就能补挂止盈止损。
+
+    休息时段内：主循环不产生信号、止盈止损单已挂交易所，本线程也停止检查，
+    真正「什么都不做」。
     """
     global _running
     while _running:
-        try:
-            with _rm_lock:
-                manage_pending_orders(rm)
-                sync_positions_from_exchange(rm)
-        except Exception as e:
-            print(f"  [监控线程] 异常: {e}")
-        # 分段 sleep，便于响应退出
+        if not _is_rest_time():
+            try:
+                with _rm_lock:
+                    manage_pending_orders(rm)
+                    sync_positions_from_exchange(rm)
+            except Exception as e:
+                print(f"  [监控线程] 异常: {e}")
+        # 分段 sleep（休息时段内也保持可响应退出），便于响应退出
         for _ in range(15):
             if not _running:
                 break
@@ -887,20 +911,56 @@ def main():
     resonance_mgr = ResonanceManager(ema10_period=10, window_size=WINDOW_SIZE,
                                      bar_interval_ms=BAR_INTERVAL_MS)
 
-    print("预热滑动窗口（并发拉历史 K 线 + 还原状态机）...")
-    t0 = time.time()
-    warm = parallel_fetch(candidates, WARMUP_LIMIT, workers=MAX_WORKERS)
-    for sym, bars in warm.items():
-        closes = [b["c"] for b in bars]
-        bar_times = [b["t"] for b in bars]
-        sema.init_symbol(sym, closes, bar_times)
-        rev_up.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
-        rev_down.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
-        # resonance 模式：初始化 EMA10 窗口 + 历史基线
-        resonance_mgr.init_symbol(sym, closes, bar_times)
-        # 缓存完整 K 线（含 o/h/l/c/v/t），后续增量判断复用
-        cache_add_bars(sym, bars)
-    print(f"预热完成: {len(warm)}/{len(candidates)} 就绪, 耗时 {time.time()-t0:.1f}s\n")
+    def _do_warmup(symbols):
+        """全量预热：拉历史 K 线，重建所有状态机 + 缓存（启动和休息恢复时复用）。"""
+        print("预热滑动窗口（并发拉历史 K 线 + 还原状态机）...")
+        t0 = time.time()
+        warm = parallel_fetch(symbols, WARMUP_LIMIT, workers=MAX_WORKERS)
+        for sym, bars in warm.items():
+            closes = [b["c"] for b in bars]
+            bar_times = [b["t"] for b in bars]
+            sema.init_symbol(sym, closes, bar_times)
+            rev_up.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
+            rev_down.warmup(sym, sema._closes[sym], period=EMA_PERIOD)
+            # resonance 模式：初始化 EMA10 窗口 + 历史基线
+            resonance_mgr.init_symbol(sym, closes, bar_times)
+            # 缓存完整 K 线（含 o/h/l/c/v/t），后续增量判断复用
+            cache_add_bars(sym, bars)
+        print(f"预热完成: {len(warm)}/{len(symbols)} 就绪, 耗时 {time.time()-t0:.1f}s\n")
+        return len(warm)
+
+    def _reset_all_state(symbols):
+        """清空所有状态机 + 缓存（休息恢复时，等同程序重启）。"""
+        for s in symbols:
+            rev_up.reset(s)
+            rev_down.reset(s)
+            sema.reset(s)
+            resonance_mgr.reset(s)
+            cache_clear_symbol(s)
+            if pullback_mgr is not None:
+                pullback_mgr.reset(s)
+
+    def _sleep_until_rest_end():
+        """一次性 sleep 到 rest_end（本机时间），分段 sleep 便于响应退出信号。"""
+        def _to_min(t):
+            h, m = t.split(":")
+            return int(h) * 60 + int(m)
+        e = _to_min(REST_END)
+        while _running:
+            now = time.localtime()
+            hm = now.tm_hour * 60 + now.tm_min
+            # 计算到 rest_end 的分钟差（支持跨午夜）
+            if e > hm:
+                diff_min = e - hm
+            else:
+                diff_min = (e + 24 * 60) - hm
+            if diff_min <= 0:
+                break
+            # 分段 sleep（最多 60 秒一段），便于响应 Ctrl+C / _running=False
+            sleep_s = min(60, diff_min * 60)
+            time.sleep(sleep_s)
+
+    _do_warmup(candidates)
 
     def shutdown(sig=None, frame=None):
         global _running
@@ -1185,6 +1245,17 @@ def main():
             except Exception as e:
                 print(f"[刷新] 异常: {e}")
             last_rescan = time.time()
+
+        # ── 休息时段：一次性 sleep 到 rest_end，期间不拉取/不判断/不开仓 ──
+        if _is_rest_time():
+            print(f"[{_ts()}] 进入休息时段（{REST_START}–{REST_END}），停止一切拉取/判断/开仓，"
+                  f"sleep 到 {REST_END}...\n")
+            _sleep_until_rest_end()
+            # 醒来：等同程序重启，清空状态机 + 全量预热
+            print(f"[{_ts()}] 休息结束，全量预热恢复...\n")
+            _reset_all_state(list(candidates))
+            _do_warmup(list(candidates))
+            continue
 
         # 对齐下一根信号 K 线收盘前 lead 秒
         now = time.time()

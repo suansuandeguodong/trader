@@ -166,6 +166,13 @@ _bars_cache = {}
 # 缓存访问锁（候选池刷新时会并发读写）
 _bars_cache_lock = threading.Lock()
 
+# ── 快照预判去重水位：{symbol: 最后预判过的快照 openTime} ──
+# 同一根「进行中」快照在收盘前 lead 秒窗口内会被反复拉取，用此水位避免
+# 对同一根 bar_time 重复预判/重复下单（完整推进那根由 push_close 的
+# last_bar_time 去重，快照分支需独立水位）。
+_snapshot_seen = {}
+_snapshot_seen_lock = threading.Lock()
+
 
 def cache_add_bars(symbol, bars):
     """把增量 K 线按 bar_time 去重后追加进缓存。bars 须旧→新。
@@ -958,6 +965,8 @@ def main():
             sema.reset(s)
             resonance_mgr.reset(s)
             cache_clear_symbol(s)
+            with _snapshot_seen_lock:
+                _snapshot_seen.pop(s, None)
             if pullback_mgr is not None:
                 pullback_mgr.reset(s)
 
@@ -1084,6 +1093,14 @@ def main():
 
             if bar_close_ms > now_ms:
                 # ── 进行中快照：只读预判，不写状态机、不写缓存 ──
+                # 去重：同一根进行中快照在 lead 窗口内反复拉取，只预判一次。
+                with _snapshot_seen_lock:
+                    seen_t = _snapshot_seen.get(sym, 0)
+                if b["t"] <= seen_t:
+                    continue
+                with _snapshot_seen_lock:
+                    _snapshot_seen[sym] = b["t"]
+
                 ema_snap = sema.get_ema(sym)
                 if ema_snap is None:
                     continue
@@ -1324,6 +1341,8 @@ def main():
                     sema.reset(s)
                     resonance_mgr.reset(s)
                     cache_clear_symbol(s)
+                    with _snapshot_seen_lock:
+                        _snapshot_seen.pop(s, None)
                     if pullback_mgr is not None:
                         pullback_mgr.reset(s)
                 candidates = new_candidates
@@ -1345,9 +1364,16 @@ def main():
 
         # 对齐下一根信号 K 线收盘前 lead 秒
         now = time.time()
-        next_close = (now // (BAR_INTERVAL_MS / 1000) + 1) * (BAR_INTERVAL_MS / 1000)
+        bar_sec = BAR_INTERVAL_MS / 1000
+        next_close = (now // bar_sec + 1) * bar_sec
         trigger_at = next_close - LEAD_SECONDS
-        wait_s = trigger_at - now
+        if now < trigger_at:
+            # 还没到收盘前 lead 秒：正常睡到 trigger_at
+            wait_s = trigger_at - now
+        else:
+            # 已越过 trigger_at（落在 lead 窗口内）：不再空转，睡到真正收盘点，
+            # 让「进行中快照」完整收盘后再拉，避免同一根快照被高频重复判断。
+            wait_s = next_close - now
         if wait_s > 0:
             print(f"[{_ts()}] 等待下一根 {SIGNAL_INTERVAL} K线收盘前 {LEAD_SECONDS} 秒触发 "
                   f"({time.strftime('%H:%M:%S', time.localtime(trigger_at))})...\n")

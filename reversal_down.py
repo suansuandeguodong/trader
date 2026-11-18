@@ -164,3 +164,20 @@ class EMA20ReversalDown:
 
     def reset_all(self):
         self._state.clear()
+
+    # ── 只读预判（用于「提前 10 秒快照」：判定拐头但不推进状态机）──
+
+    def would_reverse(self, symbol: str, curr_ema: float) -> bool:
+        """只读地判定：若此刻收盘，是否会触发「拐头向下」信号。
+
+        与 on_15m_close 的判定逻辑一致，但**不写 _state**。
+        """
+        if curr_ema is None or curr_ema <= 0:
+            return False
+        st = self._state.get(symbol)
+        if st is None:
+            return False
+        prev_ema = st["prev_ema"]
+        up_count = st["up_count"]
+        # 与 on_15m_close 中「curr_ema < prev_ema」分支的触发条件一致
+        return curr_ema < prev_ema and up_count >= self.min_up_bars

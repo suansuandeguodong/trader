@@ -131,13 +131,17 @@ def get_24hr_prices() -> dict:
     return prices
 
 
-def get_klines(symbol: str, interval: str, limit: int = 500) -> list:
+def get_klines(symbol: str, interval: str, limit: int = 500,
+               startTime: int = None) -> list:
     """
     获取指定周期的 K线，返回 [{t,o,h,l,c,v}, ...]（旧 → 新）。
     interval: "15m" / "3m" / "5m" 等币安支持的周期。
+    startTime: 可选，毫秒时间戳；传入后只返回 >= startTime 的 K线（用于增量拉取）。
     """
     url = f"{FAPI_BASE}/fapi/v1/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
+    if startTime is not None:
+        params["startTime"] = startTime
     raw = _fetch_json(url, params)
 
     bars = []

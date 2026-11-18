@@ -120,9 +120,10 @@ def build_candidates() -> list:
     return result
 
 
-def _fetch_bars(sym, limit):
+def _fetch_bars(sym, limit, startTime=None):
     try:
-        return sym, get_klines(sym, SIGNAL_INTERVAL, limit=limit)
+        return sym, get_klines(sym, SIGNAL_INTERVAL, limit=limit,
+                               startTime=startTime)
     except Exception:
         return sym, None
 
@@ -167,13 +168,22 @@ _bars_cache_lock = threading.Lock()
 
 
 def cache_add_bars(symbol, bars):
-    """把增量 K 线按 bar_time 去重后追加进缓存。bars 须旧→新。"""
+    """把增量 K 线按 bar_time 去重后追加进缓存。bars 须旧→新。
+
+    关键：只缓存「已收盘」的 K 线（closeTime <= now），跳过「进行中未收盘」的根。
+    否则进行中 K 线的 close 是快照，会被固化，收盘后的准确值因 bar_time 去重而
+    永远进不来，导致 EMA/拐头状态机用错收盘价（如 up_count 虚高）。
+    """
     if not bars:
         return
+    now_ms = int(time.time() * 1000)
     with _bars_cache_lock:
         existing = _bars_cache.setdefault(symbol, [])
         last_t = existing[-1]["t"] if existing else 0
         for b in bars:
+            # 只收已收盘的根（进行中的根本轮丢弃，等它下轮收盘再以准确值进入）
+            if b["t"] + BAR_INTERVAL_MS > now_ms:
+                continue
             if b["t"] > last_t:
                 existing.append(b)
                 last_t = b["t"]
@@ -195,11 +205,22 @@ _fetch_sentinel = object()
 def _produce_bars(symbols, limit, workers, out_queue):
     """生产者：线程池并发拉取，谁先完成谁 put 进有界队列。
 
-    放独立函数，便于作为生产者线程启动，与消费者（主循环）解耦。
+    增量拉取：每个 symbol 只拉「缓存水位 last_t 之后」的 K 线（startTime 精确
+    定位），默认 limit=2 —— 返回的最后一根可能是「进行中未收盘」的快照，倒数
+    第二根是「刚收盘」的完整根。二者由消费者按 closeTime 区分：
+      - closeTime > now  → 进行中快照，只用于提前预判拐头（不进缓存）
+      - closeTime <= now → 已收盘完整根，进缓存 + 推进状态机
+
+    无缓存（新币/首次）时全量拉 WARMUP_LIMIT。
     """
     def _worker(sym):
         try:
-            sym, bars = _fetch_bars(sym, limit)
+            with _bars_cache_lock:
+                last_t = _bars_cache[sym][-1]["t"] if _bars_cache.get(sym) else None
+            if last_t is None:
+                sym, bars = _fetch_bars(sym, WARMUP_LIMIT)
+            else:
+                sym, bars = _fetch_bars(sym, limit, startTime=last_t + 1)
         except Exception as e:
             bars = None
             print(f"  [拉取] {sym} 异常: {type(e).__name__}")
@@ -1041,22 +1062,89 @@ def main():
     def _judge_symbol(sym, bars, now_ms):
         """判断单个 symbol 的 K 线，返回该币本轮产生的信号列表。
 
-        纯计算 + 更新按 symbol 隔离的状态机（sema/rev_up/rev_down/resonance_mgr），
-        不同 symbol 可并发调用（各自状态字典 key 隔离，GIL 保证 dict 操作原子）。
-        返回 signals: [(sym, direction, o, c, meta), ...]
+        本函数处理「单次拉取」返回的 1~2 根，按 closeTime 区分：
+          - closeTime > now_ms  → 进行中快照：只算领先 EMA 做只读预判拐头，
+            **不推进状态机、不写缓存**（快照不能累计，避免污染）。
+          - closeTime <= now_ms → 已收盘完整根：进缓存 + 推进状态机（准确价）。
+
+        快照预判与完整推进共用同一套 body_pct / resonance 过滤逻辑，只是预判
+        用 would_reverse（只读，不改 down_count/prev_ema），完整推进用
+        on_15m_close（真推进）。返回 signals: [(sym, direction, o, c, meta), ...]
         """
         signals = []
         for idx, b in enumerate(bars):
             bar_close_ms = b["t"] + BAR_INTERVAL_MS
-            if bar_close_ms > now_ms + LEAD_SECONDS * 1000:
+            o = b["o"]
+            c = b["c"]
+            # 信号K线前一根的开盘价（stop 比较用）——从缓存回读（当前根尚未入缓存，
+            # cache_list[-1] 即「最新已收盘完整根」，也就是当前信号根的前一根）。
+            with _bars_cache_lock:
+                cache_list = _bars_cache.get(sym, [])
+            prev_open = cache_list[-1]["o"] if cache_list else None
+
+            if bar_close_ms > now_ms:
+                # ── 进行中快照：只读预判，不写状态机、不写缓存 ──
+                ema_snap = sema.get_ema(sym)
+                if ema_snap is None:
+                    continue
+                # 用快照收盘价临时算领先 EMA（不写回 sema）
+                lead_ema = c * sema.alpha + ema_snap * (1 - sema.alpha)
+
+                up_before = rev_up.get_down_count(sym)
+                down_before = rev_down.get_up_count(sym)
+
+                # 做多预判
+                if rev_up.would_reverse(sym, lead_ema):
+                    body_pct = (c - o) / o * 100 if o > 0 else 0.0
+                    if MAX_BODY_PCT >= body_pct >= MIN_BODY_PCT:
+                        # 共振判定：快照时刻 resonance_mgr._history 里 bar[-2]/bar[-1]
+                        # 的 EMA10 已就绪（它们是完整收盘价推进的），可正常判定。
+                        resonance_ok = resonance_mgr.confirm(sym, "LONG")
+                        meta = {
+                            "bar_time": b["t"],
+                            "open": o, "high": b["h"], "low": b["l"],
+                            "close": c, "volume": b["v"],
+                            "ema": lead_ema,
+                            "down_count": up_before,
+                            "body_pct": body_pct,
+                            "ema_history": list(rev_up.get_ema_history(sym)),
+                            "prev_open": prev_open,
+                            "resonance_ok": resonance_ok,
+                        }
+                        signals.append((sym, "LONG", o, c, meta))
+                        tlog.log_signal(sym, "LONG", meta)
+                        print(f"\n  >>> [预判·做多] {sym} 收盘前快照拐头向上"
+                              f"(领先EMA {lead_ema:.6f}, 快照价 {c}, "
+                              f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
+
+                # 做空预判
+                if rev_down.would_reverse(sym, lead_ema):
+                    body_pct = (c - o) / o * 100 if o > 0 else 0.0
+                    if -MAX_BODY_PCT <= body_pct <= -MIN_BODY_PCT:
+                        resonance_ok = resonance_mgr.confirm(sym, "SHORT")
+                        meta = {
+                            "bar_time": b["t"],
+                            "open": o, "high": b["h"], "low": b["l"],
+                            "close": c, "volume": b["v"],
+                            "ema": lead_ema,
+                            "up_count": down_before,
+                            "body_pct": body_pct,
+                            "ema_history": list(rev_down.get_ema_history(sym)),
+                            "prev_open": prev_open,
+                            "resonance_ok": resonance_ok,
+                        }
+                        signals.append((sym, "SHORT", o, c, meta))
+                        tlog.log_signal(sym, "SHORT", meta)
+                        print(f"\n  >>> [预判·做空] {sym} 收盘前快照拐头向下"
+                              f"(领先EMA {lead_ema:.6f}, 快照价 {c}, "
+                              f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
                 continue
+
+            # ── 已收盘完整根：先进缓存，再推进状态机 ──
+            cache_add_bars(sym, [b])
             ema = sema.push_close(sym, b["t"], b["c"])
             if ema is None:
                 continue
-            o = b["o"]
-            c = b["c"]
-            # 信号K线前一根的开盘价（止损比较用）
-            prev_open = bars[idx - 1]["o"] if idx > 0 else None
 
             # 向上拐头（做多）
             up_before = rev_up.get_down_count(sym)
@@ -1157,11 +1245,9 @@ def main():
                     break  # 哨兵：本轮数据已取尽，退出 worker
                 sym, bars = item
                 now_ms = int(time.time() * 1000)
-                # 增量合并进缓存，判断时从缓存读取完整序列（前一根 prev_open 从缓存取）
-                cache_add_bars(sym, bars)
-                with _bars_cache_lock:
-                    full = list(_bars_cache.get(sym, []))
-                sigs = _judge_symbol(sym, full, now_ms)
+                # 直接传本轮拉取的增量 bars（含可能的进行中快照）给 _judge_symbol，
+                # 快照/完整、进缓存/预判，全部在 _judge_symbol 内部区分处理。
+                sigs = _judge_symbol(sym, bars, now_ms)
                 for sig in sigs:
                     signal_queue.put(sig)
 

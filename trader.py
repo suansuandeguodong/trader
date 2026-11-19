@@ -881,11 +881,11 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
         return
     t.entry_order_id = order.get("orderId")
     t.entry_order_time = time.time()
-    # 记录信号K线时间（观察期计时起点）
+    # 记录信号K线时间（观察期计时起点）。
+    # 注：bar_time 去重已在 _process_signals 里「开仓尝试前」统一标记，
+    # 这里不再重复，避免下单失败路径遗漏标记导致旧信号重试。
     if meta:
         t.signal_bar_time = meta.get("bar_time")
-        # 记录「已为该 bar_time 开过仓」，跨平仓存续，防止同一根旧信号重复开仓
-        _mark_bar_opened(sym, direction, meta.get("bar_time"))
     # 生成 trade_id 并记录开仓事件
     t.trade_id = tlog.make_trade_id(sym, direction, t.entry_order_time)
     tlog.log_open(sym, direction, t.trade_id, entry, stop, tp, qty,
@@ -1091,6 +1091,10 @@ def main():
                         if not resonance_ok:
                             print(f"  [跳过] {sym} {direction} 共振不成立（EMA10未同向拐头），放弃信号")
                             continue
+                        # 失败即作废：开仓尝试前就标记 bar_time，无论下单成功还是
+                        # 失败（如余额不足），同一根 K 线信号都不再重试。
+                        if bar_time is not None:
+                            _mark_bar_opened(sym, direction, bar_time)
                         open_trade(rm, sym, direction, o, c, meta)
                     elif ENABLE_PULLBACK and pullback_mgr is not None:
                         prev_open = meta.get("prev_open") if meta else None

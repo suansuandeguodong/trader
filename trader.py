@@ -1124,14 +1124,14 @@ def main():
     def _judge_symbol(sym, bars, now_ms):
         """判断单个 symbol 的 K 线，返回该币本轮产生的信号列表。
 
-        本函数处理「单次拉取」返回的 1~2 根，按 closeTime 区分：
-          - closeTime > now_ms  → 进行中快照：只算领先 EMA 做只读预判拐头，
-            **不推进状态机、不写缓存**（快照不能累计，避免污染）。
-          - closeTime <= now_ms → 已收盘完整根：进缓存 + 推进状态机（准确价）。
+        本函数处理「单次拉取」返回的 1~2 根，按 closeTime 区分，职责分离：
+          - closeTime > now_ms  → 进行中快照：算领先 EMA 做只读预判拐头，
+            **这是唯一的下单判断入口**。快照不写缓存、不推状态机。
+          - closeTime <= now_ms → 已收盘完整根：只推进状态机（写缓存 + 推
+            EMA20/EMA10 + 拐头计数），**不再做开仓判断**，避免同一根 K 线
+            判开仓两次。
 
-        快照预判与完整推进共用同一套 body_pct / resonance 过滤逻辑，只是预判
-        用 would_reverse（只读，不改 down_count/prev_ema），完整推进用
-        on_15m_close（真推进）。返回 signals: [(sym, direction, o, c, meta), ...]
+        返回 signals 仅来自「快照预判」分支。
         """
         signals = []
         for idx, b in enumerate(bars):
@@ -1210,69 +1210,18 @@ def main():
                               f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
                 continue
 
-            # ── 已收盘完整根：先进缓存，再推进状态机 ──
+            # ── 已收盘完整根：只推进状态机，不做开仓判断 ──
+            # 开仓判断已由「快照预判」在收盘前 10 秒完成；此处只负责把准确
+            # 收盘价写入缓存、推进 EMA20/EMA10 与拐头状态机，供下一根快照
+            # 预判使用。不再产生信号，避免「同一根 K 线判开仓两次」。
             cache_add_bars(sym, [b])
             ema = sema.push_close(sym, b["t"], b["c"])
             if ema is None:
                 continue
-
-            # 向上拐头（做多）
-            up_before = rev_up.get_down_count(sym)
-            is_up = rev_up.on_15m_close(sym, ema)
-            if is_up:
-                body_pct = (c - o) / o * 100 if o > 0 else 0.0
-                if body_pct > MAX_BODY_PCT:
-                    print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% > {MAX_BODY_PCT}%（实体过大）")
-                elif body_pct >= MIN_BODY_PCT:
-                    resonance_ok = resonance_mgr.confirm(sym, "LONG")
-                    meta = {
-                        "bar_time": b["t"],
-                        "open": o, "high": b["h"], "low": b["l"],
-                        "close": c, "volume": b["v"],
-                        "ema": ema,
-                        "down_count": up_before,
-                        "body_pct": body_pct,
-                        "ema_history": list(rev_up.get_ema_history(sym)),
-                        "prev_open": prev_open,
-                        "resonance_ok": resonance_ok,
-                    }
-                    signals.append((sym, "LONG", o, c, meta))
-                    tlog.log_signal(sym, "LONG", meta)
-                    print(f"\n  >>> [信号·做多] {sym} 拐头向上 "
-                          f"(前持续不涨 {up_before} 根, 实涨 {body_pct:.2f}%, "
-                          f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
-                elif body_pct < MIN_BODY_PCT:
-                    print(f"  [过滤] {sym} 拐头但实涨 {body_pct:.2f}% < {MIN_BODY_PCT}%")
-
-            # 向下拐头（做空）
-            down_before = rev_down.get_up_count(sym)
-            is_down = rev_down.on_15m_close(sym, ema)
-            if is_down:
-                body_pct = (c - o) / o * 100 if o > 0 else 0.0
-                if body_pct < -MAX_BODY_PCT:
-                    print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% < -{MAX_BODY_PCT}%（实体过大）")
-                elif body_pct <= -MIN_BODY_PCT:
-                    resonance_ok = resonance_mgr.confirm(sym, "SHORT")
-                    meta = {
-                        "bar_time": b["t"],
-                        "open": o, "high": b["h"], "low": b["l"],
-                        "close": c, "volume": b["v"],
-                        "ema": ema,
-                        "up_count": down_before,
-                        "body_pct": body_pct,
-                        "ema_history": list(rev_down.get_ema_history(sym)),
-                        "prev_open": prev_open,
-                        "resonance_ok": resonance_ok,
-                    }
-                    signals.append((sym, "SHORT", o, c, meta))
-                    tlog.log_signal(sym, "SHORT", meta)
-                    print(f"\n  >>> [信号·做空] {sym} 拐头向下 "
-                          f"(前持续不跌 {down_before} 根, 实跌 {body_pct:.2f}%, "
-                          f"共振{'成立' if resonance_ok else '不成立'}) <<<\n")
-                elif body_pct > -MIN_BODY_PCT:
-                    print(f"  [过滤] {sym} 拐头但实跌 {body_pct:.2f}% > {-MIN_BODY_PCT}%")
-
-            # 推进 EMA10 历史（确保下根 bar[-1] 判断时 history 停在当前根）
+            # 推进拐头方向状态机（只更新 down_count/up_count/prev_ema，不触发信号）
+            rev_up.on_15m_close(sym, ema)
+            rev_down.on_15m_close(sym, ema)
+            # 推进 EMA10 历史
             resonance_mgr.push_close(sym, b["t"], b["c"])
 
         return signals

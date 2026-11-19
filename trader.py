@@ -173,6 +173,41 @@ _bars_cache_lock = threading.Lock()
 _snapshot_seen = {}
 _snapshot_seen_lock = threading.Lock()
 
+# ── 已开仓信号 bar_time 去重：{(symbol, direction): set(bar_time)} ──
+# 关键：同一根 K 线的拐头信号会被「快照预判」和「完整推进」各触发一次。
+# 若首次触发后止盈/止损平仓（rm.trades 的 key 被 remove_trade 清掉），
+# 下一轮同一根 bar_time 的旧信号会再次通过 has_position_or_order 检查、
+# 造成「用 5 分钟前的旧信号重复开仓」。此记录跨平仓存续，挡住同一根
+# bar_time 不再开仓。
+_opened_bars = {}
+_opened_bars_lock = threading.Lock()
+
+
+def _mark_bar_opened(symbol, direction, bar_time):
+    """记录「已为某根 bar_time 开过仓」，跨平仓存续，用于去重旧信号。"""
+    if bar_time is None:
+        return
+    key = (symbol, direction)
+    with _opened_bars_lock:
+        opened = _opened_bars.setdefault(key, set())
+        opened.add(bar_time)
+        # 只保留最近 50 根，防止无限增长（50 根足够覆盖相邻信号去重需求）
+        if len(opened) > 50:
+            # 转列表按时间排序丢弃最旧的（bar_time 是 ms 时间戳，可排序）
+            keep = sorted(opened)[-50:]
+            _opened_bars[key] = set(keep)
+
+
+def _clear_bar_opened(symbol, direction=None):
+    """清理某 symbol 的已开仓去重记录（候选池移除 / reset 时调用）。"""
+    with _opened_bars_lock:
+        if direction is None:
+            for k in list(_opened_bars.keys()):
+                if k[0] == symbol:
+                    _opened_bars.pop(k, None)
+        else:
+            _opened_bars.pop((symbol, direction), None)
+
 
 def cache_add_bars(symbol, bars):
     """把增量 K 线按 bar_time 去重后追加进缓存。bars 须旧→新。
@@ -849,6 +884,8 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
     # 记录信号K线时间（观察期计时起点）
     if meta:
         t.signal_bar_time = meta.get("bar_time")
+        # 记录「已为该 bar_time 开过仓」，跨平仓存续，防止同一根旧信号重复开仓
+        _mark_bar_opened(sym, direction, meta.get("bar_time"))
     # 生成 trade_id 并记录开仓事件
     t.trade_id = tlog.make_trade_id(sym, direction, t.entry_order_time)
     tlog.log_open(sym, direction, t.trade_id, entry, stop, tp, qty,
@@ -967,6 +1004,7 @@ def main():
             cache_clear_symbol(s)
             with _snapshot_seen_lock:
                 _snapshot_seen.pop(s, None)
+            _clear_bar_opened(s)
             if pullback_mgr is not None:
                 pullback_mgr.reset(s)
 
@@ -1034,6 +1072,16 @@ def main():
                 if rm.has_position_or_order(sym, direction):
                     print(f"  [跳过] {sym} {direction} 已在持仓/挂单中")
                     continue
+                # 去重：同一根 bar_time 的旧信号不重复开仓（防止快照开仓→止盈→
+                # 完整推进又用同一根 K 线旧信号再开一次）。
+                bar_time = meta.get("bar_time") if meta else None
+                if bar_time is not None:
+                    with _opened_bars_lock:
+                        opened = _opened_bars.get((sym, direction), set())
+                    if bar_time in opened:
+                        print(f"  [跳过] {sym} {direction} 该 K 线已开过仓（bar_time={bar_time}），"
+                              f"忽略旧信号")
+                        continue
                 if not rm.can_open_new():
                     print(f"  [跳过] {sym} 已达最大持仓 {MAX_POSITIONS}")
                     continue
@@ -1344,6 +1392,7 @@ def main():
                     cache_clear_symbol(s)
                     with _snapshot_seen_lock:
                         _snapshot_seen.pop(s, None)
+                    _clear_bar_opened(s)
                     if pullback_mgr is not None:
                         pullback_mgr.reset(s)
                 candidates = new_candidates

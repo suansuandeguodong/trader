@@ -35,6 +35,9 @@ class BinanceFutures:
         # 缓存 exchangeInfo 的符号精度信息
         self._symbol_info: Dict[str, Dict[str, Any]] = {}
         self._symbol_info_ts = 0.0
+        # 缓存每币最大杠杆（leverageBracket）
+        self._max_leverage: Dict[str, int] = {}
+        self._max_leverage_ts = 0.0
         # 本地时间与币安服务器时间的偏移量（毫秒）。启动时校准，避免 timestamp 超前后报 -1021。
         self._time_offset_ms = 0
         self._last_calibrate_ts = 0.0  # 上次校准的本地时刻（秒），用于周期性重校准
@@ -193,6 +196,29 @@ class BinanceFutures:
 
     def get_min_notional(self, symbol: str) -> float:
         return self.get_symbol_info(symbol).get("min_notional", 5.0)
+
+    # ── 每币最大杠杆 ──
+    def _load_max_leverage(self, force: bool = False):
+        """拉取全量 leverageBracket，缓存每个 symbol 的最大杠杆（一小时有效）。"""
+        if self._max_leverage and not force and time.time() - self._max_leverage_ts < 3600:
+            return
+        data = self._signed("GET", "/fapi/v1/leverageBracket")
+        if isinstance(data, list):
+            for item in data:
+                sym = item.get("symbol", "")
+                brackets = item.get("brackets", [])
+                if not sym or not brackets:
+                    continue
+                # 最大杠杆 = 所有档位里最大的 initialLeverage
+                max_lev = max((int(b.get("initialLeverage", 0)) for b in brackets), default=0)
+                if max_lev > 0:
+                    self._max_leverage[sym] = max_lev
+            self._max_leverage_ts = time.time()
+
+    def get_max_leverage(self, symbol: str) -> int:
+        """返回某币最大可用杠杆；查不到则返回一个保守默认值（25）。"""
+        self._load_max_leverage()
+        return self._max_leverage.get(symbol, 25)
 
     # ── 账户/持仓 ──
     def get_account(self) -> dict:

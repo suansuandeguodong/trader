@@ -853,19 +853,19 @@ def open_trade(rm: RiskManager, sym: str, direction: str, o: float, c: float,
         print(f"  [跳过] {sym} 名义值 {notional:.2f}U < 最小 {min_notional}U")
         return
 
-    # 设置杠杆（尝试，失败不阻断，但打印真实原因）
+    # 设置杠杆：实际杠杆 = min(全局配置 LEVERAGE, 该币 maxLeverage)。
+    # 避免对某些不支持高杠杆的币设过高导致失败，同时不超全局上限。
     try:
-        lev_r = rm.broker.set_leverage(sym, LEVERAGE)
+        target_lev = min(LEVERAGE, rm.broker.get_max_leverage(sym))
+        lev_r = rm.broker.set_leverage(sym, target_lev)
         if lev_r:
-            # 成功：币安返回 leverage 字段
             actual = lev_r.get("leverage")
-            if actual is not None and int(actual) != LEVERAGE:
-                print(f"  [杠杆] {sym} 实际杠杆 {actual}x（请求 {LEVERAGE}x）")
+            if actual is not None and int(actual) != target_lev:
+                print(f"  [杠杆] {sym} 实际杠杆 {actual}x（请求 {target_lev}x）")
         else:
-            # 失败：打印提示（时间戳错误修复后，这里通常是币种不支持该杠杆）
-            print(f"  [杠杆] {sym} 设置 {LEVERAGE}x 未成功，将使用账户现有杠杆")
+            print(f"  [杠杆] {sym} 设置 {target_lev}x 未成功，将使用账户现有杠杆")
     except Exception as e:
-        print(f"  [杠杆] {sym} 设置 {LEVERAGE}x 异常: {e}")
+        print(f"  [杠杆] {sym} 设置杠杆异常: {e}")
 
     side = rm.side_for_entry(direction)
     pos_side = rm.position_side(direction)
